@@ -32,9 +32,19 @@ main { max-width:1400px; margin:auto; padding:24px }
 .queue-stats { display:flex; gap:8px; flex-wrap:wrap }
 .queue-active { border:1px solid #285a42; background:#10271d; border-radius:12px; padding:14px; margin-bottom:12px }
 .queue-active.idle { border-color:var(--line); background:#10161e }
+.queue-active-line { display:flex; align-items:center; justify-content:space-between; gap:12px }
+.stop-btn { border:1px solid #743b3b; background:#391d1d; color:#ffaaaa; border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; white-space:nowrap }
+.stop-btn:hover { background:#512525 }.stop-btn:disabled { opacity:.55; cursor:wait }
 .queue-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,2fr); gap:16px }
+.pending-title { margin-top:18px }
+.queue-filters { display:grid; grid-template-columns:minmax(180px,1.4fr) repeat(3,minmax(110px,1fr)) auto; gap:8px; margin-bottom:12px }
+.queue-filters input,.queue-filters select { width:100%; min-width:0; border:1px solid var(--line); background:#0f151d; color:#eef3f8; border-radius:8px; padding:7px 9px; font:inherit }
+.secondary-btn { border:1px solid var(--line); background:#18212b; color:#d9e2ec; border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; white-space:nowrap }
+.secondary-btn:hover { background:#202c38 }.secondary-btn:disabled { opacity:.45; cursor:default }
+.pagination { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:12px; color:var(--muted); font-size:12px }
+.pagination-actions { display:flex; align-items:center; gap:8px }
 .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:7px; background:var(--muted) }
-.status-dot.running { background:var(--accent) }.status-dot.completed { background:var(--accent2) }.status-dot.failed { background:#ff7b7b }.status-dot.queued { background:#ffd166 }
+.status-dot.running { background:var(--accent) }.status-dot.completed { background:var(--accent2) }.status-dot.failed { background:#ff7b7b }.status-dot.queued { background:#ffd166 }.status-dot.cancelled { background:var(--muted) }
 .full { grid-column:1/-1 }
 .empty { color:var(--muted); padding:8px 0 }
 .chart-wrap { width:100%; height:220px }
@@ -45,7 +55,7 @@ th { color:var(--muted); font-weight:600; font-size:11px; text-transform:upperca
 td.num, th.num { text-align:center }
 code.pid { color:var(--muted) }
 code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all; text-overflow:clip }
-@media(max-width:1000px){ .grid{grid-template-columns:repeat(2,1fr)} .grid3{grid-template-columns:1fr} .grid2{grid-template-columns:1fr} }
+@media(max-width:1000px){ .grid{grid-template-columns:repeat(2,1fr)} .grid3{grid-template-columns:1fr} .grid2{grid-template-columns:1fr} .queue-filters{grid-template-columns:repeat(2,minmax(0,1fr))} }
 @media(max-width:650px){ .grid{grid-template-columns:1fr} main{padding:14px} header{padding:16px} }
 </style>
 </head>
@@ -57,8 +67,18 @@ code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all;
       <div class="queue-head"><h2 style="margin:0">Очередь задач GPU</h2><div class="queue-stats"><span class="pill" id="queue-state">подключение…</span><span class="pill" id="queue-count">ожидают: —</span></div></div>
       <div id="queue-active" class="queue-active idle"><b>GPU свободен</b><div class="muted">Активных задач нет</div></div>
       <div class="queue-grid">
-        <div><h2>Ожидают по сервисам</h2><div id="queue-services"></div></div>
-        <div><h2>Последние задачи</h2><div id="queue-recent"></div></div>
+        <div><h2>Ожидают по сервисам</h2><div id="queue-services"></div><h2 class="pending-title">Ожидающие задачи</h2><div id="queue-pending"></div></div>
+        <div><h2>Последние задачи</h2>
+          <div class="queue-filters">
+            <input id="filter-source" placeholder="ID задачи" oninput="scheduleQueueFilter()">
+            <input id="filter-service" placeholder="Сервис" oninput="scheduleQueueFilter()">
+            <select id="filter-kind" onchange="applyQueueFilters()"><option value="">Все нагрузки</option><option value="llm">Qwen</option><option value="stt">Whisper</option></select>
+            <select id="filter-status" onchange="applyQueueFilters()"><option value="">Все статусы</option><option value="running">Выполняется</option><option value="queued">В очереди</option><option value="completed">Готово</option><option value="failed">Ошибка</option><option value="cancelled">Остановлено</option></select>
+            <button class="secondary-btn" onclick="resetQueueFilters()">Сбросить</button>
+          </div>
+          <div id="queue-recent"></div>
+          <div id="queue-pagination" class="pagination"></div>
+        </div>
       </div>
     </section>
   </div>
@@ -104,23 +124,66 @@ function rows(el, items, fn){
 const palette = ['#67e8a5','#67b8e8','#e8a567','#c67ee8','#e86767'];
 const serviceNames = {'iz-scribe':'IZ.Scribe','privacy-gateway':'Privacy Gateway','unregistered':'Неизвестный сервис'};
 const kindNames = {llm:'Qwen',stt:'Whisper'};
-const statusNames = {running:'Выполняется',queued:'В очереди',completed:'Готово',failed:'Ошибка'};
+const statusNames = {running:'Выполняется',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
 const serviceLabel = s => serviceNames[s] || s;
 const kindLabel = k => kindNames[k] || k;
 const sourceId = value => value ? `<code class="pid task-id">${value}</code>` : '<span class="muted">—</span>';
 const duration = ms => ms == null ? '—' : (ms < 1000 ? `${ms} мс` : `${(ms/1000).toFixed(ms < 10000 ? 1 : 0)} с`);
 const dateTime = value => value ? new Date(value).toLocaleString() : '—';
+let queuePage = 1;
+const queuePageSize = 20;
+let queueFilterTimer = null;
+
+function queueQuery() {
+  const params = new URLSearchParams({limit:queuePageSize, offset:(queuePage-1)*queuePageSize});
+  const filters = {
+    source_id:$('filter-source').value.trim(),
+    service:$('filter-service').value.trim(),
+    kind:$('filter-kind').value,
+    status:$('filter-status').value,
+  };
+  Object.entries(filters).forEach(([key,value]) => { if (value) params.set(key,value); });
+  return params;
+}
+function scheduleQueueFilter() {
+  clearTimeout(queueFilterTimer);
+  queueFilterTimer = setTimeout(applyQueueFilters, 300);
+}
+function applyQueueFilters() { queuePage = 1; refreshQueue(); }
+function resetQueueFilters() {
+  ['filter-source','filter-service','filter-kind','filter-status'].forEach(id => $(id).value = '');
+  applyQueueFilters();
+}
+function changeQueuePage(delta) {
+  queuePage = Math.max(1, queuePage + delta);
+  refreshQueue();
+}
+
+async function stopJob(jobId) {
+  if (!jobId || !confirm('Остановить эту задачу?')) return;
+  const buttons = document.querySelectorAll(`button[data-job-id="${CSS.escape(jobId)}"]`);
+  buttons.forEach(button => { button.disabled = true; button.textContent = 'Остановка…'; });
+  try {
+    const r = await fetch(`/api/gpu-queue/${encodeURIComponent(jobId)}/cancel`, {method:'POST'});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Не удалось остановить задачу');
+    await refreshQueue();
+  } catch (e) {
+    alert(e.message || 'Не удалось остановить задачу');
+    await refreshQueue();
+  }
+}
 
 async function refreshQueue() {
   try {
-    const r = await fetch('/api/gpu-queue', {cache:'no-store'});
+    const r = await fetch(`/api/gpu-queue?${queueQuery()}`, {cache:'no-store'});
     const d = await r.json();
     $('queue-state').textContent = d.available ? 'диспетчер работает' : 'диспетчер недоступен';
     $('queue-state').className = d.available ? 'pill accent' : 'pill bad';
     $('queue-count').textContent = `ожидают: ${d.queued || 0}`;
     if (d.active) {
       $('queue-active').className = 'queue-active';
-      $('queue-active').innerHTML = `<b><span class="status-dot running"></span>${serviceLabel(d.active.service)} · ${kindLabel(d.active.kind)}</b><div class="muted">${d.active.route} · ID задачи: ${sourceId(d.active.source_id)}</div>`;
+      $('queue-active').innerHTML = `<div class="queue-active-line"><div><b><span class="status-dot running"></span>${serviceLabel(d.active.service)} · ${kindLabel(d.active.kind)}</b><div class="muted">${d.active.route} · ID задачи: ${sourceId(d.active.source_id)}</div></div><button class="stop-btn" data-job-id="${d.active.id}" onclick="stopJob('${d.active.id}')">Остановить</button></div>`;
     } else {
       $('queue-active').className = 'queue-active idle';
       $('queue-active').innerHTML = '<b>GPU свободен</b><div class="muted">Активных задач нет</div>';
@@ -130,9 +193,16 @@ async function refreshQueue() {
       const [service,kind] = key.split(':');
       return `<div class="row"><div><b>${serviceLabel(service)}</b><br><span class="muted">${kindLabel(kind)}</span></div><span class="pill">${count}</span></div>`;
     });
+    rows($('queue-pending'), d.pending || [], job => `<div class="row"><div><b>${serviceLabel(job.service)} · ${kindLabel(job.kind)}</b><br><span class="muted">ID задачи: ${sourceId(job.source_id)}</span></div><button class="stop-btn" data-job-id="${job.id}" onclick="stopJob('${job.id}')">Стоп</button></div>`);
     const recent = d.recent || [];
-    if (!recent.length) $('queue-recent').innerHTML = '<div class="empty">история пока пуста</div>';
-    else $('queue-recent').innerHTML = `<table><thead><tr><th style="width:170px">ID задачи</th><th>Сервис</th><th>Нагрузка</th><th>Статус</th><th>Поставлена</th><th class="num">Ожидание</th><th class="num">Работа</th></tr></thead><tbody>${recent.slice(0,10).map(j => `<tr><td>${sourceId(j.source_id)}</td><td>${serviceLabel(j.service)}</td><td>${kindLabel(j.kind)}</td><td><span class="status-dot ${j.status}"></span>${statusNames[j.status] || j.status}</td><td>${dateTime(j.queued_at)}</td><td class="num">${duration(j.wait_ms)}</td><td class="num">${duration(j.run_ms)}</td></tr>`).join('')}</tbody></table>`;
+    const total = Number(d.recent_total || 0);
+    const totalPages = Math.max(1, Math.ceil(total / queuePageSize));
+    if (queuePage > totalPages) { queuePage = totalPages; refreshQueue(); return; }
+    if (!recent.length) $('queue-recent').innerHTML = '<div class="empty">по заданным фильтрам задач нет</div>';
+    else $('queue-recent').innerHTML = `<table><thead><tr><th style="width:170px">ID задачи</th><th>Сервис</th><th>Нагрузка</th><th>Статус</th><th>Поставлена</th><th class="num">Ожидание</th><th class="num">Работа</th><th></th></tr></thead><tbody>${recent.map(j => `<tr><td>${sourceId(j.source_id)}</td><td>${serviceLabel(j.service)}</td><td>${kindLabel(j.kind)}</td><td><span class="status-dot ${j.status}"></span>${statusNames[j.status] || j.status}</td><td>${dateTime(j.queued_at)}</td><td class="num">${duration(j.wait_ms)}</td><td class="num">${duration(j.run_ms)}</td><td>${['queued','running'].includes(j.status) ? `<button class="stop-btn" data-job-id="${j.id}" onclick="stopJob('${j.id}')">Стоп</button>` : ''}</td></tr>`).join('')}</tbody></table>`;
+    const first = total ? (queuePage-1)*queuePageSize+1 : 0;
+    const last = Math.min(queuePage*queuePageSize, total);
+    $('queue-pagination').innerHTML = `<span>Записи ${first}–${last} из ${total}</span><div class="pagination-actions"><button class="secondary-btn" ${queuePage<=1?'disabled':''} onclick="changeQueuePage(-1)">Назад</button><span>${queuePage} / ${totalPages}</span><button class="secondary-btn" ${queuePage>=totalPages?'disabled':''} onclick="changeQueuePage(1)">Далее</button></div>`;
   } catch (e) {
     $('queue-state').textContent = 'ошибка подключения';
     $('queue-state').className = 'pill bad';

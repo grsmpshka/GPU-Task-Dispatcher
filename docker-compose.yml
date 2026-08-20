@@ -13,6 +13,8 @@ services:
       GPU_MAX_BATCH_TASKS: "${GPU_MAX_BATCH_TASKS:-12}"
       GPU_MAX_BATCH_SECONDS: "${GPU_MAX_BATCH_SECONDS:-300}"
       GPU_REQUEST_TIMEOUT_SECONDS: "${GPU_REQUEST_TIMEOUT_SECONDS:-10800}"
+      GPU_OLLAMA_RELEASE_DELAY_SECONDS: "${GPU_OLLAMA_RELEASE_DELAY_SECONDS:-4}"
+      GPU_JOB_HISTORY_LIMIT: "${GPU_JOB_HISTORY_LIMIT:-100000}"
     volumes:
       - "${GPU_DISPATCHER_DATA_DIR:-/srv/data/gpu-task-dispatcher}:/data"
     healthcheck:
@@ -31,6 +33,7 @@ services:
     environment:
       OLLAMA_URL: "${OLLAMA_URL:-http://127.0.0.1:11434}"
       GPU_DISPATCHER_URL: "http://127.0.0.1:11435"
+      GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN}"
       DISK_PATHS: "/hostfs,/hostfs-srv"
       WHISPER_PROCESS_NAMES: "whisper,faster-whisper,whisper.cpp,speaches"
       AI_GPU_PROCESS_NAMES: "ollama,llama-server"
@@ -47,4 +50,3 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-

@@ -11,8 +11,8 @@ from typing import Any
 
 import psutil
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Query
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
@@ -24,6 +24,7 @@ except Exception:
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 GPU_DISPATCHER_URL = os.getenv("GPU_DISPATCHER_URL", "http://127.0.0.1:11435").rstrip("/")
+GPU_DISPATCHER_TOKEN = os.getenv("GPU_DISPATCHER_TOKEN", "")
 
 # Comma-separated list of mount points to report disk usage for.
 # Default matches a typical bare-metal host with a separate /srv volume.
@@ -484,11 +485,13 @@ async def ollama_get(path: str):
         return {"error": str(e)}
 
 
-async def get_gpu_queue() -> dict[str, Any]:
-    """Return the shared dispatcher state without exposing control actions."""
+async def get_gpu_queue(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the shared dispatcher state."""
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(f"{GPU_DISPATCHER_URL}/queue", params={"limit": 10})
+            response = await client.get(
+                f"{GPU_DISPATCHER_URL}/queue", params=params or {"limit": 20}
+            )
             response.raise_for_status()
             return {"available": True, **response.json()}
     except Exception as exc:
@@ -650,8 +653,36 @@ async def get_history():
 
 
 @app.get("/api/gpu-queue")
-async def gpu_queue():
-    return await get_gpu_queue()
+async def gpu_queue(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    service: str = Query("", max_length=80),
+    kind: str = Query("", max_length=20),
+    status: str = Query("", max_length=20),
+    source_id: str = Query("", max_length=160),
+):
+    return await get_gpu_queue({
+        "limit": limit,
+        "offset": offset,
+        "service": service,
+        "kind": kind,
+        "status": status,
+        "source_id": source_id,
+    })
+
+
+@app.post("/api/gpu-queue/{job_id}/cancel")
+async def cancel_gpu_job(job_id: str):
+    headers = {"X-GPU-Dispatcher-Token": GPU_DISPATCHER_TOKEN} if GPU_DISPATCHER_TOKEN else {}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{GPU_DISPATCHER_URL}/queue/{job_id}/cancel", headers=headers
+            )
+        data = response.json()
+        return JSONResponse(status_code=response.status_code, content=data)
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"detail": f"Dispatcher unavailable: {exc}"})
 
 
 @app.get("/")

@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -31,6 +32,8 @@ DATA_PATH = Path(os.getenv("GPU_DISPATCHER_DATA", "/data/dispatcher.db"))
 MAX_BATCH_TASKS = max(1, int(os.getenv("GPU_MAX_BATCH_TASKS", "12")))
 MAX_BATCH_SECONDS = max(1, int(os.getenv("GPU_MAX_BATCH_SECONDS", "300")))
 REQUEST_TIMEOUT = max(30, int(os.getenv("GPU_REQUEST_TIMEOUT_SECONDS", "10800")))
+OLLAMA_RELEASE_DELAY = max(0.0, float(os.getenv("GPU_OLLAMA_RELEASE_DELAY_SECONDS", "4")))
+JOB_HISTORY_LIMIT = max(1000, int(os.getenv("GPU_JOB_HISTORY_LIMIT", "100000")))
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
@@ -59,6 +62,14 @@ class Journal:
         columns = {row[1] for row in self._db.execute("pragma table_info(gpu_jobs)")}
         if "source_id" not in columns:
             self._db.execute("alter table gpu_jobs add column source_id text")
+        # In-memory requests cannot survive a dispatcher restart.  Without
+        # reconciliation they remain visibly queued/running forever.
+        now = utcnow()
+        self._db.execute(
+            "update gpu_jobs set status='cancelled',completed_at=?,error=? "
+            "where status in ('queued','running')",
+            (now, "Dispatcher restarted before the task finished"),
+        )
         self._db.commit()
 
     def queued(self, job_id: str, service: str, source_id: str, kind: str, route: str) -> None:
@@ -83,20 +94,71 @@ class Journal:
                 "update gpu_jobs set status=?,completed_at=?,run_ms=?,http_status=?,error=? where id=?",
                 (status, utcnow(), run_ms, http_status, error[:1000], job_id),
             )
-            self._db.execute(
-                "delete from gpu_jobs where id in (select id from gpu_jobs order by queued_at desc limit -1 offset 10000)"
-            )
+            self._prune_locked()
             self._db.commit()
 
-    def recent(self, limit: int = 50) -> list[dict[str, object]]:
-        limit = max(1, min(limit, 500))
+    def _prune_locked(self) -> None:
+        self._db.execute(
+            "delete from gpu_jobs where id in ("
+            "select id from gpu_jobs where status not in ('queued','running') "
+            "order by queued_at desc limit -1 offset ?)",
+            (JOB_HISTORY_LIMIT,),
+        )
+
+    def cancelled(self, job_id: str, run_ms: int | None = None, error: str = "Cancelled by operator") -> bool:
         with self._lock:
             cursor = self._db.execute(
-                "select source_id,service,kind,route,status,queued_at,started_at,completed_at,wait_ms,run_ms,http_status,error "
-                "from gpu_jobs order by queued_at desc limit ?", (limit,)
+                "update gpu_jobs set status='cancelled',completed_at=?,run_ms=coalesce(?,run_ms),error=? "
+                "where id=? and status in ('queued','running')",
+                (utcnow(), run_ms, error[:1000], job_id),
+            )
+            self._prune_locked()
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _history_filter(
+        service: str = "", kind: str = "", status: str = "", source_id: str = ""
+    ) -> tuple[str, list[str]]:
+        clauses: list[str] = []
+        values: list[str] = []
+        for column, value in (("service", service), ("kind", kind), ("status", status)):
+            if value:
+                clauses.append(f"{column}=?")
+                values.append(value)
+        if source_id:
+            clauses.append("instr(lower(coalesce(source_id,'')), lower(?)) > 0")
+            values.append(source_id)
+        return (" where " + " and ".join(clauses) if clauses else ""), values
+
+    def recent(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        service: str = "",
+        kind: str = "",
+        status: str = "",
+        source_id: str = "",
+    ) -> list[dict[str, object]]:
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        where, values = self._history_filter(service, kind, status, source_id)
+        with self._lock:
+            cursor = self._db.execute(
+                "select id,source_id,service,kind,route,status,queued_at,started_at,completed_at,wait_ms,run_ms,http_status,error "
+                f"from gpu_jobs{where} order by queued_at desc limit ? offset ?",
+                (*values, limit, offset),
             )
             columns = [item[0] for item in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def recent_count(
+        self, service: str = "", kind: str = "", status: str = "", source_id: str = ""
+    ) -> int:
+        where, values = self._history_filter(service, kind, status, source_id)
+        with self._lock:
+            row = self._db.execute(f"select count(*) from gpu_jobs{where}", values).fetchone()
+            return int(row[0])
 
 
 @dataclass
@@ -108,6 +170,8 @@ class Ticket:
     route: str
     queued_at: float = field(default_factory=time.monotonic)
     ready: asyncio.Event = field(default_factory=asyncio.Event)
+    owner: asyncio.Task[object] | None = None
+    started_at: float | None = None
 
 
 class FairGpuQueue:
@@ -124,11 +188,23 @@ class FairGpuQueue:
 
     async def acquire(self, service: str, source_id: str, kind: str, route: str) -> Ticket:
         ticket = Ticket(uuid.uuid4().hex, service, source_id, kind, route)
+        ticket.owner = asyncio.current_task()
         self.journal.queued(ticket.id, service, source_id, kind, route)
         async with self._guard:
             self._pending.append(ticket)
             self._schedule_locked()
-        await ticket.ready.wait()
+        try:
+            await ticket.ready.wait()
+        except asyncio.CancelledError:
+            async with self._guard:
+                if ticket in self._pending:
+                    self._pending.remove(ticket)
+                if self._active is ticket:
+                    self._active = None
+                self._schedule_locked()
+            self.journal.cancelled(ticket.id, error="Request cancelled while waiting")
+            raise
+        ticket.started_at = time.monotonic()
         self.journal.running(ticket.id, int((time.monotonic() - ticket.queued_at) * 1000))
         return ticket
 
@@ -137,6 +213,27 @@ class FairGpuQueue:
             if self._active is ticket:
                 self._active = None
             self._schedule_locked()
+
+    async def cancel(self, job_id: str) -> str:
+        """Cancel a live request and immediately remove pending work."""
+        async with self._guard:
+            ticket = next((item for item in self._pending if item.id == job_id), None)
+            if ticket is not None:
+                self._pending.remove(ticket)
+            elif self._active is not None and self._active.id == job_id:
+                ticket = self._active
+            else:
+                return "not_found"
+
+            run_ms = None
+            if ticket.started_at is not None:
+                run_ms = int((time.monotonic() - ticket.started_at) * 1000)
+            self.journal.cancelled(ticket.id, run_ms)
+            if ticket.owner is not None and not ticket.owner.done():
+                ticket.owner.cancel()
+            if ticket is not self._active:
+                self._schedule_locked()
+            return "cancelled"
 
     def _schedule_locked(self) -> None:
         if self._active is not None or not self._pending:
@@ -176,6 +273,7 @@ class FairGpuQueue:
             "queued": len(self._pending),
             "pending": [
                 {
+                    "id": item.id,
                     "service": item.service,
                     "source_id": item.source_id,
                     "kind": item.kind,
@@ -208,6 +306,11 @@ async def unload_ollama(client: httpx.AsyncClient) -> None:
         for _ in range(120):
             state = await client.get(f"{OLLAMA_URL}/api/ps")
             if not state.json().get("models"):
+                # /api/ps becomes empty slightly before the NVIDIA driver has
+                # destroyed Ollama's CUDA context. Starting PyTorch in that
+                # window produces cudaErrorDevicesUnavailable.
+                if OLLAMA_RELEASE_DELAY:
+                    await asyncio.sleep(OLLAMA_RELEASE_DELAY)
                 return
             await asyncio.sleep(0.5)
         raise RuntimeError("Ollama model did not unload within 60 seconds")
@@ -301,8 +404,39 @@ async def health() -> dict[str, object]:
 
 
 @app.get("/queue")
-async def queue_status(limit: int = 50) -> dict[str, object]:
-    return {**queue.snapshot(), "recent": journal.recent(limit)}
+async def queue_status(
+    limit: int = 50,
+    offset: int = 0,
+    service: str = "",
+    kind: str = "",
+    status: str = "",
+    source_id: str = "",
+) -> dict[str, object]:
+    filters = {
+        "service": service.strip()[:80],
+        "kind": kind.strip()[:20],
+        "status": status.strip()[:20],
+        "source_id": source_id.strip()[:160],
+    }
+    return {
+        **queue.snapshot(),
+        "recent": journal.recent(limit, offset, **filters),
+        "recent_total": journal.recent_count(**filters),
+        "recent_limit": max(1, min(limit, 500)),
+        "recent_offset": max(0, offset),
+    }
+
+
+@app.post("/queue/{job_id}/cancel")
+async def cancel_job(job_id: str, request: Request) -> JSONResponse:
+    if DISPATCHER_TOKEN and not secrets.compare_digest(
+        request.headers.get("x-gpu-dispatcher-token", ""), DISPATCHER_TOKEN
+    ):
+        return JSONResponse(status_code=401, content={"detail": "Invalid dispatcher token"})
+    result = await queue.cancel(job_id)
+    if result == "not_found":
+        return JSONResponse(status_code=404, content={"detail": "Task is not active or queued"})
+    return JSONResponse(content={"status": result, "job_id": job_id})
 
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
