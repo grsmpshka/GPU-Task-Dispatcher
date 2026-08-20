@@ -31,6 +31,7 @@ DATA_PATH = Path(os.getenv("GPU_DISPATCHER_DATA", "/data/dispatcher.db"))
 MAX_BATCH_TASKS = max(1, int(os.getenv("GPU_MAX_BATCH_TASKS", "12")))
 MAX_BATCH_SECONDS = max(1, int(os.getenv("GPU_MAX_BATCH_SECONDS", "300")))
 REQUEST_TIMEOUT = max(30, int(os.getenv("GPU_REQUEST_TIMEOUT_SECONDS", "10800")))
+OLLAMA_RELEASE_DELAY = max(0.0, float(os.getenv("GPU_OLLAMA_RELEASE_DELAY_SECONDS", "4")))
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
@@ -208,6 +209,10 @@ async def unload_ollama(client: httpx.AsyncClient) -> None:
         for _ in range(120):
             state = await client.get(f"{OLLAMA_URL}/api/ps")
             if not state.json().get("models"):
+                # Ollama reports an empty model list slightly before its CUDA
+                # context has been destroyed by the NVIDIA driver.
+                if OLLAMA_RELEASE_DELAY:
+                    await asyncio.sleep(OLLAMA_RELEASE_DELAY)
                 return
             await asyncio.sleep(0.5)
         raise RuntimeError("Ollama model did not unload within 60 seconds")
