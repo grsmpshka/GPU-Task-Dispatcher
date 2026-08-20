@@ -18,7 +18,7 @@ services:
     volumes:
       - "${GPU_DISPATCHER_DATA_DIR:-/srv/data/gpu-task-dispatcher}:/data"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11435/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11435/queue', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 5
