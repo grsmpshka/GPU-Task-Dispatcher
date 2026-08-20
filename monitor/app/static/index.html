@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Local AI Monitor</title>
+<style>
+:root { color-scheme: dark; --bg:#0b0f14; --card:#121821; --muted:#8c98a8; --line:#202a36; --accent:#67e8a5; --accent2:#67b8e8; --accent3:#e8a567; }
+* { box-sizing:border-box }
+body { margin:0; background:var(--bg); color:#eef3f8; font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif }
+header { padding:22px 28px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center }
+h1 { margin:0; font-size:22px } h2 { margin:0 0 16px; font-size:16px }
+#status { color:var(--muted); font-size:12px }
+main { max-width:1400px; margin:auto; padding:24px }
+.grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin-bottom:16px }
+.grid3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin-bottom:16px }
+.grid2 { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-bottom:16px }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px }
+.big { font-size:32px; font-weight:700; margin:6px 0 }
+.muted { color:var(--muted) }
+.bar { height:9px; background:#202a36; border-radius:99px; overflow:hidden; margin-top:10px }
+.fill { height:100%; background:var(--accent); border-radius:99px; transition:width .5s }
+.row { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:10px 0; border-bottom:1px solid var(--line) }
+.row:last-child { border-bottom:0 }
+.row > *:first-child { min-width:0 }
+.row > *:last-child { flex-shrink:0 }
+.pill { display:inline-block; padding:3px 8px; border-radius:999px; background:#1c2934; color:var(--muted); font-size:11px; white-space:nowrap }
+.pill.accent { color:var(--accent); background:#12301f }
+.ok { color:var(--accent) } .warn { color:#ffd166 }
+.bad { color:#ff7b7b }
+.queue-head { display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:14px }
+.queue-stats { display:flex; gap:8px; flex-wrap:wrap }
+.queue-active { border:1px solid #285a42; background:#10271d; border-radius:12px; padding:14px; margin-bottom:12px }
+.queue-active.idle { border-color:var(--line); background:#10161e }
+.queue-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,2fr); gap:16px }
+.status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:7px; background:var(--muted) }
+.status-dot.running { background:var(--accent) }.status-dot.completed { background:var(--accent2) }.status-dot.failed { background:#ff7b7b }.status-dot.queued { background:#ffd166 }
+.full { grid-column:1/-1 }
+.empty { color:var(--muted); padding:8px 0 }
+.chart-wrap { width:100%; height:220px }
+canvas { width:100%; height:100%; display:block }
+table { width:100%; border-collapse:collapse; font-size:13px; table-layout:fixed }
+th,td { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase }
+td.num, th.num { text-align:center }
+code.pid { color:var(--muted) }
+code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all; text-overflow:clip }
+@media(max-width:1000px){ .grid{grid-template-columns:repeat(2,1fr)} .grid3{grid-template-columns:1fr} .grid2{grid-template-columns:1fr} }
+@media(max-width:650px){ .grid{grid-template-columns:1fr} main{padding:14px} header{padding:16px} }
+</style>
+</head>
+<body>
+<header><h1>Local AI Monitor</h1><div id="status">подключение…</div></header>
+<main>
+  <div class="grid">
+    <section class="card full" id="queue-card">
+      <div class="queue-head"><h2 style="margin:0">Очередь задач GPU</h2><div class="queue-stats"><span class="pill" id="queue-state">подключение…</span><span class="pill" id="queue-count">ожидают: —</span></div></div>
+      <div id="queue-active" class="queue-active idle"><b>GPU свободен</b><div class="muted">Активных задач нет</div></div>
+      <div class="queue-grid">
+        <div><h2>Ожидают по сервисам</h2><div id="queue-services"></div></div>
+        <div><h2>Последние задачи</h2><div id="queue-recent"></div></div>
+      </div>
+    </section>
+  </div>
+  <div class="grid" id="top-grid">
+    <section class="card"><h2>CPU</h2><div id="cpu" class="big">—</div><div class="muted" id="cpu-meta">—</div><div class="bar"><div id="cpu-bar" class="fill" style="width:0%"></div></div></section>
+    <section class="card"><h2>RAM</h2><div id="ram" class="big">—</div><div class="muted" id="ram-meta">—</div><div class="bar"><div id="ram-bar" class="fill" style="width:0%"></div></div></section>
+    <section class="card"><h2>Ollama</h2><div id="ollama-status" class="big">—</div><div class="muted" id="ollama-meta">—</div></section>
+    <section class="card"><h2>История</h2><div class="big" id="hist-window">—</div><div class="muted" id="hist-meta">—</div></section>
+  </div>
+
+  <div class="grid" id="disks-grid"></div>
+
+  <div class="grid2">
+    <section class="card"><h2>CPU / RAM — история</h2><div class="chart-wrap"><canvas id="chart-cpu"></canvas></div></section>
+    <section class="card"><h2>GPU utilization / VRAM — история</h2><div class="chart-wrap"><canvas id="chart-gpu"></canvas></div></section>
+  </div>
+
+  <div class="grid">
+    <section class="card full"><h2>GPU</h2><div id="gpu-list"></div></section>
+  </div>
+
+  <div class="grid3">
+    <section class="card"><h2>Процессы на GPU (Ollama / Whisper)</h2><div id="gpu-procs"></div></section>
+    <section class="card"><h2>Загруженные модели Ollama</h2><div id="loaded"></div></section>
+    <section class="card"><h2>Все модели Ollama</h2><div id="models"></div></section>
+  </div>
+
+  <div class="grid">
+    <section class="card full"><h2>Whisper</h2><div id="whisper"></div></section>
+  </div>
+
+  <div class="grid">
+    <section class="card full"><h2>Docker-контейнеры</h2><div id="docker"></div></section>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const gb = n => `${Number(n).toFixed(2)} GB`;
+function setBar(id,v){ $(id).style.width=Math.max(0,Math.min(100,v))+'%'; }
+function rows(el, items, fn){
+  el.innerHTML = items.length ? items.map(fn).join('') : '<div class="empty">нет данных</div>';
+}
+const palette = ['#67e8a5','#67b8e8','#e8a567','#c67ee8','#e86767'];
+const serviceNames = {'iz-scribe':'IZ.Scribe','privacy-gateway':'Privacy Gateway','unregistered':'Неизвестный сервис'};
+const kindNames = {llm:'Qwen',stt:'Whisper'};
+const statusNames = {running:'Выполняется',queued:'В очереди',completed:'Готово',failed:'Ошибка'};
+const serviceLabel = s => serviceNames[s] || s;
+const kindLabel = k => kindNames[k] || k;
+const sourceId = value => value ? `<code class="pid task-id">${value}</code>` : '<span class="muted">—</span>';
+const duration = ms => ms == null ? '—' : (ms < 1000 ? `${ms} мс` : `${(ms/1000).toFixed(ms < 10000 ? 1 : 0)} с`);
+const dateTime = value => value ? new Date(value).toLocaleString() : '—';
+
+async function refreshQueue() {
+  try {
+    const r = await fetch('/api/gpu-queue', {cache:'no-store'});
+    const d = await r.json();
+    $('queue-state').textContent = d.available ? 'диспетчер работает' : 'диспетчер недоступен';
+    $('queue-state').className = d.available ? 'pill accent' : 'pill bad';
+    $('queue-count').textContent = `ожидают: ${d.queued || 0}`;
+    if (d.active) {
+      $('queue-active').className = 'queue-active';
+      $('queue-active').innerHTML = `<b><span class="status-dot running"></span>${serviceLabel(d.active.service)} · ${kindLabel(d.active.kind)}</b><div class="muted">${d.active.route} · ID задачи: ${sourceId(d.active.source_id)}</div>`;
+    } else {
+      $('queue-active').className = 'queue-active idle';
+      $('queue-active').innerHTML = '<b>GPU свободен</b><div class="muted">Активных задач нет</div>';
+    }
+    const groups = Object.entries(d.by_service_kind || {});
+    rows($('queue-services'), groups, ([key,count]) => {
+      const [service,kind] = key.split(':');
+      return `<div class="row"><div><b>${serviceLabel(service)}</b><br><span class="muted">${kindLabel(kind)}</span></div><span class="pill">${count}</span></div>`;
+    });
+    const recent = d.recent || [];
+    if (!recent.length) $('queue-recent').innerHTML = '<div class="empty">история пока пуста</div>';
+    else $('queue-recent').innerHTML = `<table><thead><tr><th style="width:170px">ID задачи</th><th>Сервис</th><th>Нагрузка</th><th>Статус</th><th>Поставлена</th><th class="num">Ожидание</th><th class="num">Работа</th></tr></thead><tbody>${recent.slice(0,10).map(j => `<tr><td>${sourceId(j.source_id)}</td><td>${serviceLabel(j.service)}</td><td>${kindLabel(j.kind)}</td><td><span class="status-dot ${j.status}"></span>${statusNames[j.status] || j.status}</td><td>${dateTime(j.queued_at)}</td><td class="num">${duration(j.wait_ms)}</td><td class="num">${duration(j.run_ms)}</td></tr>`).join('')}</tbody></table>`;
+  } catch (e) {
+    $('queue-state').textContent = 'ошибка подключения';
+    $('queue-state').className = 'pill bad';
+  }
+}
+
+// ---- lightweight canvas line chart (no external deps) -----------------
+function drawLineChart(canvas, datasets, opts) {
+  opts = opts || {};
+  const min = opts.min ?? 0;
+  const max = opts.max ?? 100;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || canvas.parentElement.clientWidth || 400;
+  const cssH = canvas.clientHeight || 220;
+  canvas.width = Math.max(1, Math.round(cssW * dpr));
+  canvas.height = Math.max(1, Math.round(cssH * dpr));
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 34, padR = 8, padT = 22, padB = 18;
+  const plotW = Math.max(1, cssW - padL - padR);
+  const plotH = Math.max(1, cssH - padT - padB);
+
+  ctx.strokeStyle = '#202a36';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#8c98a8';
+  ctx.font = '10px system-ui,-apple-system,sans-serif';
+  const steps = 4;
+  for (let i = 0; i <= steps; i++) {
+    const y = padT + plotH * i / steps;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(cssW - padR, y); ctx.stroke();
+    const val = max - (max - min) * i / steps;
+    ctx.fillText(val.toFixed(0), 2, y + 3);
+  }
+
+  const n = Math.max(1, ...datasets.map(d => d.data.length), 1);
+  if (!datasets.length || n <= 1) {
+    ctx.fillStyle = '#8c98a8';
+    ctx.fillText('накопление данных…', padL, padT + plotH / 2);
+  }
+
+  datasets.forEach(ds => {
+    const data = ds.data;
+    if (!data || !data.length) return;
+    ctx.strokeStyle = ds.color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash(ds.dash || []);
+    ctx.beginPath();
+    let started = false;
+    data.forEach((v, i) => {
+      if (v === null || v === undefined) { started = false; return; }
+      const x = padL + plotW * (n <= 1 ? 0 : i / (n - 1));
+      const clamped = Math.min(max, Math.max(min, v));
+      const y = padT + plotH * (1 - (clamped - min) / (max - min));
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  });
+
+  // legend
+  let lx = padL;
+  ctx.font = '10px system-ui,-apple-system,sans-serif';
+  datasets.forEach(ds => {
+    ctx.fillStyle = ds.color;
+    ctx.fillRect(lx, 4, 8, 8);
+    ctx.fillStyle = '#eef3f8';
+    ctx.fillText(ds.label, lx + 12, 12);
+    lx += ctx.measureText(ds.label).width + 26;
+  });
+}
+
+let lastHistory = null;
+function renderCharts() {
+  if (!lastHistory) return;
+  const d = lastHistory;
+  try {
+    drawLineChart($('chart-cpu'), [
+      { label: 'CPU %', color: '#67e8a5', data: d.points.map(p => p.cpu_percent) },
+      { label: 'RAM %', color: '#67b8e8', data: d.points.map(p => p.ram_percent) },
+    ], { min: 0, max: 100 });
+  } catch (e) { console.error('chart-cpu', e); }
+
+  try {
+    const gpuIndices = new Set();
+    d.points.forEach(p => (p.gpu || []).forEach(g => gpuIndices.add(g.index)));
+    const sortedIdx = [...gpuIndices].sort((a, b) => a - b);
+    const datasets = [];
+    sortedIdx.forEach((idx, i) => {
+      const color = palette[i % palette.length];
+      datasets.push({
+        label: `GPU${idx} util %`, color,
+        data: d.points.map(p => { const g = (p.gpu || []).find(x => x.index === idx); return g ? g.utilization : null; }),
+      });
+      datasets.push({
+        label: `GPU${idx} VRAM %`, color, dash: [4, 3],
+        data: d.points.map(p => {
+          const g = (p.gpu || []).find(x => x.index === idx);
+          return g && g.vram_total_gb ? (100 * g.vram_used_gb / g.vram_total_gb) : null;
+        }),
+      });
+    });
+    drawLineChart($('chart-gpu'), datasets, { min: 0, max: 100 });
+  } catch (e) { console.error('chart-gpu', e); }
+}
+window.addEventListener('resize', () => { try { renderCharts(); } catch (e) {} });
+
+function fmtTime(t) { return new Date(t * 1000).toLocaleTimeString(); }
+
+async function refreshHistory() {
+  try {
+    const r = await fetch('/api/history', { cache: 'no-store' });
+    const d = await r.json();
+    lastHistory = d;
+    $('hist-window').textContent = `${d.window_min.toFixed(0)} мин`;
+    $('hist-meta').textContent = `шаг ${d.interval_sec}s · ${d.points.length} точек`;
+    renderCharts();
+  } catch (e) { console.error('history', e); }
+}
+
+// ---- live metrics -------------------------------------------------------
+async function refresh() {
+  try {
+    const r = await fetch('/api/metrics', { cache: 'no-store' });
+    const d = await r.json();
+
+    $('cpu').textContent = d.cpu.percent.toFixed(0) + '%';
+    $('cpu-meta').textContent = `${d.cpu.cores} логических ядер · load1 ${d.cpu.load1 != null ? d.cpu.load1.toFixed(2) : '—'}`;
+    setBar('cpu-bar', d.cpu.percent);
+
+    $('ram').textContent = d.ram.percent.toFixed(0) + '%';
+    $('ram-meta').textContent = `${gb(d.ram.used_gb)} / ${gb(d.ram.total_gb)}`;
+    setBar('ram-bar', d.ram.percent);
+
+    $('ollama-status').innerHTML = d.ollama.available ? '<span class="ok">ONLINE</span>' : '<span class="warn">OFFLINE</span>';
+    $('ollama-meta').textContent = `${d.ollama.models.length} моделей · ${d.ollama.loaded_models.length} загружено`;
+
+    rows($('disks-grid'), [...d.disks, { __network: true, ...d.network }], item => {
+      if (item.__network) {
+        const down = item.rx_mb_s != null ? item.rx_mb_s.toFixed(1) : '—';
+        const up = item.tx_mb_s != null ? item.tx_mb_s.toFixed(1) : '—';
+        return `<section class="card"><h2>Сеть</h2><div class="big">↓ ${down} MB/s</div>
+          <div class="muted">↑ ${up} MB/s · всего ${gb(item.rx_total_gb)} / ${gb(item.tx_total_gb)}</div></section>`;
+      }
+      if (item.error) return `<section class="card"><h2>${item.path}</h2><div class="empty">ошибка: ${item.error}</div></section>`;
+      const io = item.read_mb_s != null
+        ? `↓ ${item.read_mb_s.toFixed(1)} MB/s · ↑ ${item.write_mb_s.toFixed(1)} MB/s`
+        : 'I/O: —';
+      return `<section class="card"><h2>${item.path}</h2><div class="big">${(100 - item.percent).toFixed(0)}% свободно</div>
+        <div class="muted">${gb(item.free_gb)} свободно из ${gb(item.total_gb)}</div>
+        <div class="bar"><div class="fill" style="width:${item.percent}%"></div></div>
+        <div class="muted" style="margin-top:8px">${io}</div></section>`;
+    });
+
+    rows($('gpu-list'), d.gpu, g => `
+      <div class="row"><div><b>GPU ${g.index}: ${g.name}</b><br><span class="muted">VRAM ${gb(g.vram_used_gb)} / ${gb(g.vram_total_gb)} · ${g.temperature_c ?? '—'}°C · ${g.power_w ?? '—'} W</span></div>
+      <div style="min-width:170px"><b>${g.utilization.toFixed(0)}%</b> GPU<div class="bar"><div class="fill" style="width:${g.utilization}%"></div></div></div></div>`);
+
+    const allProcs = [];
+    d.gpu.forEach(g => (g.processes || []).forEach(p => allProcs.push({ ...p, gpu_index: g.index })));
+    if (allProcs.length) {
+      $('gpu-procs').innerHTML = `<table><colgroup><col style="width:34px"><col style="width:56px"><col><col><col style="width:74px"></colgroup>` +
+        `<thead><tr><th class="num">GPU</th><th class="num">PID</th><th>Процесс</th><th>Модель (оценка)</th><th class="num">VRAM</th></tr></thead><tbody>` +
+        allProcs.map(p => `<tr><td class="num">${p.gpu_index}</td><td class="num"><code class="pid">${p.pid}</code></td><td title="${p.process_path || p.process_name}">${p.process_name}</td>` +
+          `<td>${p.matched_model ? `<span class="pill accent">${p.matched_model}</span>` : '<span class="muted">—</span>'}</td>` +
+          `<td class="num">${gb(p.vram_gb)}</td></tr>`).join('') + `</tbody></table>`;
+    } else {
+      $('gpu-procs').innerHTML = '<div class="empty">нет данных</div>';
+    }
+
+    rows($('loaded'), d.ollama.loaded_models, m => `<div class="row"><div><b>${m.name}</b><br><span class="muted">${gb(m.size_gb)} total · context ${m.context_length ?? '—'}</span></div><span class="pill">${gb(m.vram_gb)} VRAM</span></div>`);
+    rows($('models'), d.ollama.models, m => `<div class="row"><div><b>${m.name}</b><br><span class="muted">${m.parameter_size ?? '—'} · ${m.quantization ?? '—'}</span></div><span class="pill">${gb(m.size_gb)}</span></div>`);
+    rows($('whisper'), d.whisper.processes, p => `<div class="row"><div><b>${p.name}</b> <span class="pill">PID ${p.pid}</span><br><span class="muted">${p.cmdline}</span></div><div>${p.cpu_percent.toFixed(0)}% CPU<br>${gb(p.ram_gb)} RAM</div></div>`);
+
+    if (!d.docker.available) {
+      $('docker').innerHTML = '<div class="empty">нет доступа к Docker (сокет не подключён к монитору — см. README)</div>';
+    } else if (!d.docker.containers.length) {
+      $('docker').innerHTML = '<div class="empty">нет запущенных контейнеров</div>';
+    } else {
+      $('docker').innerHTML = `<table><colgroup><col><col><col><col style="width:90px"><col style="width:130px"></colgroup>` +
+        `<thead><tr><th>Контейнер</th><th>Образ</th><th>Статус</th><th class="num">CPU</th><th class="num">RAM</th></tr></thead><tbody>` +
+        d.docker.containers.map(c => `<tr><td title="${c.name}">${c.name}</td><td title="${c.image}">${c.image}</td><td>${c.status}</td>` +
+          `<td class="num">${c.cpu_percent != null ? c.cpu_percent.toFixed(1) + '%' : '—'}</td>` +
+          `<td class="num">${c.mem_gb != null ? gb(c.mem_gb) : '—'}${c.mem_percent != null ? ` (${c.mem_percent.toFixed(0)}%)` : ''}</td></tr>`).join('') + `</tbody></table>`;
+    }
+
+    $('status').textContent = 'обновлено ' + new Date().toLocaleTimeString();
+  } catch (e) { $('status').textContent = 'ошибка подключения'; console.error('metrics', e); }
+}
+
+refresh();
+setInterval(refresh, 1000);
+refreshQueue();
+setInterval(refreshQueue, 2000);
+refreshHistory();
+setInterval(refreshHistory, 5000);
+</script>
+</body>
+</html>

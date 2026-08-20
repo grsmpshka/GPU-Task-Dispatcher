@@ -1,0 +1,50 @@
+services:
+  dispatcher:
+    build: ./dispatcher
+    image: gpu-task-dispatcher:latest
+    container_name: gpu-task-dispatcher
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      GPU_DISPATCHER_PORT: "11435"
+      OLLAMA_URL: "${OLLAMA_URL:-http://127.0.0.1:11434}"
+      WHISPER_URL: "${WHISPER_URL:-http://127.0.0.1:8000}"
+      GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN}"
+      GPU_MAX_BATCH_TASKS: "${GPU_MAX_BATCH_TASKS:-12}"
+      GPU_MAX_BATCH_SECONDS: "${GPU_MAX_BATCH_SECONDS:-300}"
+      GPU_REQUEST_TIMEOUT_SECONDS: "${GPU_REQUEST_TIMEOUT_SECONDS:-10800}"
+    volumes:
+      - "${GPU_DISPATCHER_DATA_DIR:-/srv/data/gpu-task-dispatcher}:/data"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11435/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  monitor:
+    build: ./monitor
+    image: gpu-task-monitor:latest
+    container_name: gpu-task-monitor
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    environment:
+      OLLAMA_URL: "${OLLAMA_URL:-http://127.0.0.1:11434}"
+      GPU_DISPATCHER_URL: "http://127.0.0.1:11435"
+      DISK_PATHS: "/hostfs,/hostfs-srv"
+      WHISPER_PROCESS_NAMES: "whisper,faster-whisper,whisper.cpp,speaches"
+      AI_GPU_PROCESS_NAMES: "ollama,llama-server"
+    volumes:
+      - /:/hostfs:ro
+      - /srv:/hostfs-srv:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    gpus: all
+    depends_on:
+      dispatcher:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9999/', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
