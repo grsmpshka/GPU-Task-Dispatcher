@@ -1,0 +1,16 @@
+[Unit]
+Description=Ollama GPU worker %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ollama
+Group=ollama
+EnvironmentFile=/etc/gpu-task-dispatcher/ollama-%i.env
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

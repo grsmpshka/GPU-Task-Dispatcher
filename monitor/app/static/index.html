@@ -29,10 +29,13 @@ main { max-width:1400px; margin:auto; padding:24px }
 .ok { color:var(--accent) } .warn { color:#ffd166 }
 .bad { color:#ff7b7b }
 .queue-head { display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:14px }
+.recent-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:16px }
+.recent-head h2 { margin:0 }
 .queue-stats { display:flex; gap:8px; flex-wrap:wrap }
 .queue-active { border:1px solid #285a42; background:#10271d; border-radius:12px; padding:14px; margin-bottom:12px }
 .queue-active.idle { border-color:var(--line); background:#10161e }
 .queue-active-line { display:flex; align-items:center; justify-content:space-between; gap:12px }
+.queue-active-line + .queue-active-line { margin-top:10px; padding-top:10px; border-top:1px solid #285a42 }
 .stop-btn { border:1px solid #743b3b; background:#391d1d; color:#ffaaaa; border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; white-space:nowrap }
 .stop-btn:hover { background:#512525 }.stop-btn:disabled { opacity:.55; cursor:wait }
 .queue-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,2fr); gap:16px }
@@ -41,20 +44,32 @@ main { max-width:1400px; margin:auto; padding:24px }
 .queue-filters input,.queue-filters select { width:100%; min-width:0; border:1px solid var(--line); background:#0f151d; color:#eef3f8; border-radius:8px; padding:7px 9px; font:inherit }
 .secondary-btn { border:1px solid var(--line); background:#18212b; color:#d9e2ec; border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; white-space:nowrap }
 .secondary-btn:hover { background:#202c38 }.secondary-btn:disabled { opacity:.45; cursor:default }
+.clear-history-btn { border:1px solid #743b3b; background:#251617; color:#ffaaaa; border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; font-size:12px; white-space:nowrap }
+.clear-history-btn:hover { background:#391d1d }.clear-history-btn:disabled { opacity:.55; cursor:wait }
 .pagination { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:12px; color:var(--muted); font-size:12px }
 .pagination-actions { display:flex; align-items:center; gap:8px }
+.page-size { display:flex; align-items:center; gap:4px; white-space:nowrap }
+.page-size select { border:0; background:transparent; color:var(--muted); padding:0; font:inherit; cursor:pointer }
+.page-size option { background:#121821; color:#eef3f8 }
 .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:7px; background:var(--muted) }
 .status-dot.running { background:var(--accent) }.status-dot.completed { background:var(--accent2) }.status-dot.failed { background:#ff7b7b }.status-dot.queued { background:#ffd166 }.status-dot.cancelled { background:var(--muted) }
 .full { grid-column:1/-1 }
 .empty { color:var(--muted); padding:8px 0 }
 .chart-wrap { width:100%; height:220px }
 canvas { width:100%; height:100%; display:block }
+.queue-table-wrap { overflow-x:auto }
+.queue-table { min-width:980px }
+.queue-table .row-number { width:42px; text-align:center }
+.queue-table .queued-time { width:166px; overflow:visible; text-overflow:clip }
 table { width:100%; border-collapse:collapse; font-size:13px; table-layout:fixed }
 th,td { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
 th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase }
 td.num, th.num { text-align:center }
 code.pid { color:var(--muted) }
 code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all; text-overflow:clip }
+.task-link { color:var(--accent2); text-decoration:none }
+.task-link code { color:inherit; border-bottom:1px dashed currentColor }
+.task-link:hover code { color:#a9ddff; border-bottom-style:solid }
 @media(max-width:1000px){ .grid{grid-template-columns:repeat(2,1fr)} .grid3{grid-template-columns:1fr} .grid2{grid-template-columns:1fr} .queue-filters{grid-template-columns:repeat(2,minmax(0,1fr))} }
 @media(max-width:650px){ .grid{grid-template-columns:1fr} main{padding:14px} header{padding:16px} }
 </style>
@@ -68,7 +83,7 @@ code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all;
       <div id="queue-active" class="queue-active idle"><b>GPU свободен</b><div class="muted">Активных задач нет</div></div>
       <div class="queue-grid">
         <div><h2>Ожидают по сервисам</h2><div id="queue-services"></div><h2 class="pending-title">Ожидающие задачи</h2><div id="queue-pending"></div></div>
-        <div><h2>Последние задачи</h2>
+        <div><div class="recent-head"><h2>Последние задачи</h2><button id="clear-history" class="clear-history-btn" onclick="clearHistory()">Очистить историю</button></div>
           <div class="queue-filters">
             <input id="filter-source" placeholder="ID задачи" oninput="scheduleQueueFilter()">
             <input id="filter-service" placeholder="Сервис" oninput="scheduleQueueFilter()">
@@ -127,11 +142,16 @@ const kindNames = {llm:'Qwen',stt:'Whisper'};
 const statusNames = {running:'Выполняется',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
 const serviceLabel = s => serviceNames[s] || s;
 const kindLabel = k => kindNames[k] || k;
+const workerLabel = job => job.worker_label || job.worker_id || 'GPU';
 const sourceId = value => value ? `<code class="pid task-id">${value}</code>` : '<span class="muted">—</span>';
+const taskLink = job => `<a class="task-link" href="/tasks/${encodeURIComponent(job.id)}" title="Открыть запрос и ответ"><code class="pid task-id">${job.source_id || job.id}</code></a>`;
 const duration = ms => ms == null ? '—' : (ms < 1000 ? `${ms} мс` : `${(ms/1000).toFixed(ms < 10000 ? 1 : 0)} с`);
-const dateTime = value => value ? new Date(value).toLocaleString() : '—';
+const dateTime = value => value ? new Date(value).toLocaleString('ru-RU', {
+  day:'2-digit', month:'2-digit', year:'numeric',
+  hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false,
+}) : '—';
 let queuePage = 1;
-const queuePageSize = 20;
+let queuePageSize = 10;
 let queueFilterTimer = null;
 
 function queueQuery() {
@@ -158,6 +178,11 @@ function changeQueuePage(delta) {
   queuePage = Math.max(1, queuePage + delta);
   refreshQueue();
 }
+function changeQueuePageSize() {
+  queuePageSize = Number($('queue-page-size').value) || 10;
+  queuePage = 1;
+  refreshQueue();
+}
 
 async function stopJob(jobId) {
   if (!jobId || !confirm('Остановить эту задачу?')) return;
@@ -174,16 +199,44 @@ async function stopJob(jobId) {
   }
 }
 
+async function clearHistory() {
+  if (!confirm('Удалить всю завершённую историю задач? Выполняющиеся и ожидающие задачи будут сохранены.')) return;
+  const button = $('clear-history');
+  button.disabled = true;
+  button.textContent = 'Очистка…';
+  try {
+    const response = await fetch('/api/gpu-queue/history/clear',{method:'POST'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось очистить историю');
+    queuePage = 1;
+    await refreshQueue();
+  } catch (error) {
+    alert(error.message || 'Не удалось очистить историю');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Очистить историю';
+  }
+}
+
 async function refreshQueue() {
   try {
     const r = await fetch(`/api/gpu-queue?${queueQuery()}`, {cache:'no-store'});
     const d = await r.json();
-    $('queue-state').textContent = d.available ? 'диспетчер работает' : 'диспетчер недоступен';
+    const workerCount = Array.isArray(d.workers) ? d.workers.length : 1;
+    $('queue-state').textContent = d.available ? `диспетчер работает · GPU: ${workerCount}` : 'диспетчер недоступен';
     $('queue-state').className = d.available ? 'pill accent' : 'pill bad';
-    $('queue-count').textContent = `ожидают: ${d.queued || 0}`;
-    if (d.active) {
+    $('queue-count').textContent = `ожидают задач: ${d.queued_tasks ?? d.queued ?? 0}`;
+    const activeJobs = Array.isArray(d.active_jobs) ? d.active_jobs : (d.active ? [d.active] : []);
+    const idleOwners = (Array.isArray(d.task_owners) ? d.task_owners : (d.task_owner ? [d.task_owner] : [])).filter(owner => owner.idle);
+    if (activeJobs.length || idleOwners.length) {
       $('queue-active').className = 'queue-active';
-      $('queue-active').innerHTML = `<div class="queue-active-line"><div><b><span class="status-dot running"></span>${serviceLabel(d.active.service)} · ${kindLabel(d.active.kind)}</b><div class="muted">${d.active.route} · ID задачи: ${sourceId(d.active.source_id)}</div></div><button class="stop-btn" data-job-id="${d.active.id}" onclick="stopJob('${d.active.id}')">Остановить</button></div>`;
+      $('queue-active').innerHTML = [
+        ...activeJobs.map(job => `<div class="queue-active-line"><div><b><span class="status-dot running"></span>${workerLabel(job)} · ${serviceLabel(job.service)} · ${kindLabel(job.kind)}</b><div class="muted">${job.route} · ID задачи: ${sourceId(job.source_id)}</div></div><button class="stop-btn" data-job-id="${job.id}" onclick="stopJob('${job.id}')">Остановить</button></div>`),
+        ...idleOwners.map(owner => {
+          const seconds = owner.release_in_ms == null ? '' : ` · освобождение через ${Math.max(1,Math.ceil(owner.release_in_ms/1000))} с`;
+          return `<div class="queue-active-line"><div><b><span class="status-dot queued"></span>${workerLabel(owner)} · ${serviceLabel(owner.service)} · задача удерживает слот</b><div class="muted">ID задачи: ${sourceId(owner.source_id)}${seconds}</div></div></div>`;
+        }),
+      ].join('');
     } else {
       $('queue-active').className = 'queue-active idle';
       $('queue-active').innerHTML = '<b>GPU свободен</b><div class="muted">Активных задач нет</div>';
@@ -193,16 +246,16 @@ async function refreshQueue() {
       const [service,kind] = key.split(':');
       return `<div class="row"><div><b>${serviceLabel(service)}</b><br><span class="muted">${kindLabel(kind)}</span></div><span class="pill">${count}</span></div>`;
     });
-    rows($('queue-pending'), d.pending || [], job => `<div class="row"><div><b>${serviceLabel(job.service)} · ${kindLabel(job.kind)}</b><br><span class="muted">ID задачи: ${sourceId(job.source_id)}</span></div><button class="stop-btn" data-job-id="${job.id}" onclick="stopJob('${job.id}')">Стоп</button></div>`);
+    rows($('queue-pending'), d.task_queue || d.pending || [], job => `<div class="row"><div><b>${serviceLabel(job.service)} · ${kindLabel(job.kind)}</b><br><span class="muted">ID задачи: ${sourceId(job.source_id)}${job.worker_id ? ` · ${workerLabel(job)}` : ''}${job.request_count > 1 ? ` · запросов: ${job.request_count}` : ''}</span></div><button class="stop-btn" data-job-id="${job.id}" onclick="stopJob('${job.id}')">Стоп</button></div>`);
     const recent = d.recent || [];
     const total = Number(d.recent_total || 0);
     const totalPages = Math.max(1, Math.ceil(total / queuePageSize));
     if (queuePage > totalPages) { queuePage = totalPages; refreshQueue(); return; }
     if (!recent.length) $('queue-recent').innerHTML = '<div class="empty">по заданным фильтрам задач нет</div>';
-    else $('queue-recent').innerHTML = `<table><thead><tr><th style="width:170px">ID задачи</th><th>Сервис</th><th>Нагрузка</th><th>Статус</th><th>Поставлена</th><th class="num">Ожидание</th><th class="num">Работа</th><th></th></tr></thead><tbody>${recent.map(j => `<tr><td>${sourceId(j.source_id)}</td><td>${serviceLabel(j.service)}</td><td>${kindLabel(j.kind)}</td><td><span class="status-dot ${j.status}"></span>${statusNames[j.status] || j.status}</td><td>${dateTime(j.queued_at)}</td><td class="num">${duration(j.wait_ms)}</td><td class="num">${duration(j.run_ms)}</td><td>${['queued','running'].includes(j.status) ? `<button class="stop-btn" data-job-id="${j.id}" onclick="stopJob('${j.id}')">Стоп</button>` : ''}</td></tr>`).join('')}</tbody></table>`;
+    else $('queue-recent').innerHTML = `<div class="queue-table-wrap"><table class="queue-table"><thead><tr><th class="row-number">№</th><th style="width:170px">ID задачи</th><th>Сервис</th><th>Нагрузка</th><th style="width:105px">GPU</th><th>Статус</th><th class="queued-time">Поставлена</th><th class="num">Ожидание</th><th class="num">Работа</th><th></th></tr></thead><tbody>${recent.map((j,index) => `<tr><td class="row-number">${total-((queuePage-1)*queuePageSize+index)}</td><td>${taskLink(j)}</td><td>${serviceLabel(j.service)}</td><td>${kindLabel(j.kind)}</td><td>${j.worker_id ? workerLabel(j) : '—'}</td><td><span class="status-dot ${j.status}"></span>${statusNames[j.status] || j.status}</td><td class="queued-time">${dateTime(j.queued_at)}</td><td class="num">${duration(j.wait_ms)}</td><td class="num">${duration(j.run_ms)}</td><td>${['queued','running'].includes(j.status) ? `<button class="stop-btn" data-job-id="${j.id}" onclick="stopJob('${j.id}')">Стоп</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`;
     const first = total ? (queuePage-1)*queuePageSize+1 : 0;
     const last = Math.min(queuePage*queuePageSize, total);
-    $('queue-pagination').innerHTML = `<span>Записи ${first}–${last} из ${total}</span><div class="pagination-actions"><button class="secondary-btn" ${queuePage<=1?'disabled':''} onclick="changeQueuePage(-1)">Назад</button><span>${queuePage} / ${totalPages}</span><button class="secondary-btn" ${queuePage>=totalPages?'disabled':''} onclick="changeQueuePage(1)">Далее</button></div>`;
+    $('queue-pagination').innerHTML = `<span>Записи ${first}–${last} из ${total}</span><div class="pagination-actions"><label class="page-size">Показывать: <select id="queue-page-size" onchange="changeQueuePageSize()"><option value="10" ${queuePageSize===10?'selected':''}>10</option><option value="20" ${queuePageSize===20?'selected':''}>20</option><option value="50" ${queuePageSize===50?'selected':''}>50</option><option value="100" ${queuePageSize===100?'selected':''}>100</option><option value="100000" ${queuePageSize===100000?'selected':''}>Все</option></select></label><button class="secondary-btn" ${queuePage<=1?'disabled':''} onclick="changeQueuePage(-1)">Назад</button><span>${queuePage} / ${totalPages}</span><button class="secondary-btn" ${queuePage>=totalPages?'disabled':''} onclick="changeQueuePage(1)">Далее</button></div>`;
   } catch (e) {
     $('queue-state').textContent = 'ошибка подключения';
     $('queue-state').className = 'pill bad';
@@ -374,7 +427,7 @@ async function refresh() {
       $('gpu-procs').innerHTML = '<div class="empty">нет данных</div>';
     }
 
-    rows($('loaded'), d.ollama.loaded_models, m => `<div class="row"><div><b>${m.name}</b><br><span class="muted">${gb(m.size_gb)} total · context ${m.context_length ?? '—'}</span></div><span class="pill">${gb(m.vram_gb)} VRAM</span></div>`);
+    rows($('loaded'), d.ollama.loaded_models, m => `<div class="row"><div><b>${m.name}</b><br><span class="muted">${m.worker_label ? `${m.worker_label} · ` : ''}${gb(m.size_gb)} total · context ${m.context_length ?? '—'}</span></div><span class="pill">${gb(m.vram_gb)} VRAM</span></div>`);
     rows($('models'), d.ollama.models, m => `<div class="row"><div><b>${m.name}</b><br><span class="muted">${m.parameter_size ?? '—'} · ${m.quantization ?? '—'}</span></div><span class="pill">${gb(m.size_gb)}</span></div>`);
     rows($('whisper'), d.whisper.processes, p => `<div class="row"><div><b>${p.name}</b> <span class="pill">PID ${p.pid}</span><br><span class="muted">${p.cmdline}</span></div><div>${p.cpu_percent.toFixed(0)}% CPU<br>${gb(p.ram_gb)} RAM</div></div>`);
 

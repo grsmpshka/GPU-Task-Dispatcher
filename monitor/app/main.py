@@ -23,6 +23,11 @@ except Exception:
     NVML_AVAILABLE = False
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_URLS = [
+    value.strip().rstrip("/")
+    for value in os.getenv("OLLAMA_URLS", OLLAMA_URL).split(",")
+    if value.strip()
+]
 GPU_DISPATCHER_URL = os.getenv("GPU_DISPATCHER_URL", "http://127.0.0.1:11435").rstrip("/")
 GPU_DISPATCHER_TOKEN = os.getenv("GPU_DISPATCHER_TOKEN", "")
 
@@ -475,10 +480,10 @@ def get_docker_containers() -> dict[str, Any]:
     return {"available": True, "containers": result}
 
 
-async def ollama_get(path: str):
+async def ollama_get(base_url: str, path: str):
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            r = await client.get(f"{OLLAMA_URL}{path}")
+            r = await client.get(f"{base_url}{path}")
             r.raise_for_status()
             return r.json()
     except Exception as e:
@@ -506,32 +511,48 @@ async def get_gpu_queue(params: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 async def get_ollama():
-    tags = await ollama_get("/api/tags")
-    loaded = await ollama_get("/api/ps")
+    results = await asyncio.gather(*(
+        asyncio.gather(
+            ollama_get(base_url, "/api/tags"),
+            ollama_get(base_url, "/api/ps"),
+        )
+        for base_url in OLLAMA_URLS
+    ))
 
     models = []
-    if "error" not in tags:
-        for m in tags.get("models", []):
-            models.append({
-                "name": m.get("name") or m.get("model"),
-                "size_gb": bytes_to_gb(m.get("size", 0)),
-                "parameter_size": m.get("details", {}).get("parameter_size"),
-                "quantization": m.get("details", {}).get("quantization_level"),
-            })
-
+    model_names: set[str] = set()
     loaded_models = []
-    if "error" not in loaded:
-        for m in loaded.get("models", []):
-            loaded_models.append({
-                "name": m.get("name") or m.get("model"),
-                "size_gb": bytes_to_gb(m.get("size", 0)),
-                "vram_gb": bytes_to_gb(m.get("size_vram", 0)),
-                "context_length": m.get("context_length"),
-            })
+    instances = []
+    for index, (base_url, result) in enumerate(zip(OLLAMA_URLS, results), start=1):
+        tags, loaded = result
+        available = "error" not in tags
+        instances.append({"id": f"gpu-{index}", "url": base_url, "available": available})
+        if available:
+            for m in tags.get("models", []):
+                name = m.get("name") or m.get("model")
+                if not name or name in model_names:
+                    continue
+                model_names.add(name)
+                models.append({
+                    "name": name,
+                    "size_gb": bytes_to_gb(m.get("size", 0)),
+                    "parameter_size": m.get("details", {}).get("parameter_size"),
+                    "quantization": m.get("details", {}).get("quantization_level"),
+                })
+        if "error" not in loaded:
+            for m in loaded.get("models", []):
+                loaded_models.append({
+                    "name": m.get("name") or m.get("model"),
+                    "size_gb": bytes_to_gb(m.get("size", 0)),
+                    "vram_gb": bytes_to_gb(m.get("size_vram", 0)),
+                    "context_length": m.get("context_length"),
+                    "worker_label": f"GPU {index}",
+                })
 
     return {
-        "url": OLLAMA_URL,
-        "available": "error" not in tags,
+        "url": ", ".join(OLLAMA_URLS),
+        "available": all(item["available"] for item in instances),
+        "instances": instances,
         "models": models,
         "loaded_models": loaded_models,
     }
@@ -654,7 +675,7 @@ async def get_history():
 
 @app.get("/api/gpu-queue")
 async def gpu_queue(
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=100000),
     offset: int = Query(0, ge=0),
     service: str = Query("", max_length=80),
     kind: str = Query("", max_length=20),
@@ -671,6 +692,20 @@ async def gpu_queue(
     })
 
 
+@app.post("/api/gpu-queue/history/clear")
+async def clear_gpu_history():
+    headers = {"X-GPU-Dispatcher-Token": GPU_DISPATCHER_TOKEN} if GPU_DISPATCHER_TOKEN else {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{GPU_DISPATCHER_URL}/queue/history/clear", headers=headers
+            )
+        data = response.json()
+        return JSONResponse(status_code=response.status_code, content=data)
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"detail": f"Dispatcher unavailable: {exc}"})
+
+
 @app.post("/api/gpu-queue/{job_id}/cancel")
 async def cancel_gpu_job(job_id: str):
     headers = {"X-GPU-Dispatcher-Token": GPU_DISPATCHER_TOKEN} if GPU_DISPATCHER_TOKEN else {}
@@ -685,6 +720,21 @@ async def cancel_gpu_job(job_id: str):
         return JSONResponse(status_code=503, content={"detail": f"Dispatcher unavailable: {exc}"})
 
 
+@app.get("/api/gpu-queue/{job_id}")
+async def gpu_job_detail(job_id: str):
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{GPU_DISPATCHER_URL}/queue/{job_id}")
+        return JSONResponse(status_code=response.status_code, content=response.json())
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"detail": f"Dispatcher unavailable: {exc}"})
+
+
+@app.get("/tasks/{job_id}")
+async def task_detail_page(job_id: str):
+    return FileResponse("app/static/task.html", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/")
 async def index():
-    return FileResponse("app/static/index.html")
+    return FileResponse("app/static/index.html", headers={"Cache-Control": "no-store"})

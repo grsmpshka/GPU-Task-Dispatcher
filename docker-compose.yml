@@ -9,12 +9,15 @@ services:
       GPU_DISPATCHER_PORT: "11435"
       OLLAMA_URL: "${OLLAMA_URL:-http://127.0.0.1:11434}"
       WHISPER_URL: "${WHISPER_URL:-http://127.0.0.1:8000}"
+      GPU_WORKERS_JSON: '${GPU_WORKERS_JSON:-}'
       GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN}"
       GPU_MAX_BATCH_TASKS: "${GPU_MAX_BATCH_TASKS:-12}"
       GPU_MAX_BATCH_SECONDS: "${GPU_MAX_BATCH_SECONDS:-300}"
       GPU_REQUEST_TIMEOUT_SECONDS: "${GPU_REQUEST_TIMEOUT_SECONDS:-10800}"
       GPU_OLLAMA_RELEASE_DELAY_SECONDS: "${GPU_OLLAMA_RELEASE_DELAY_SECONDS:-4}"
       GPU_JOB_HISTORY_LIMIT: "${GPU_JOB_HISTORY_LIMIT:-100000}"
+      GPU_JOB_PAYLOAD_MAX_BYTES: "${GPU_JOB_PAYLOAD_MAX_BYTES:-524288}"
+      GPU_TASK_IDLE_SECONDS: "${GPU_TASK_IDLE_SECONDS:-10}"
     volumes:
       - "${GPU_DISPATCHER_DATA_DIR:-/srv/data/gpu-task-dispatcher}:/data"
     healthcheck:
@@ -32,6 +35,7 @@ services:
     pid: host
     environment:
       OLLAMA_URL: "${OLLAMA_URL:-http://127.0.0.1:11434}"
+      OLLAMA_URLS: "${OLLAMA_URLS:-http://127.0.0.1:11434}"
       GPU_DISPATCHER_URL: "http://127.0.0.1:11435"
       GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN}"
       DISK_PATHS: "/hostfs,/hostfs-srv"
@@ -50,3 +54,49 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  whisper-gpu-1:
+    profiles: ["gpu-workers"]
+    image: whisper-service:latest
+    container_name: whisper-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - "${WHISPER_ENV_FILE:-/opt/whisper-service/.env}"
+    environment:
+      WHISPER_HOST: "0.0.0.0"
+      WHISPER_PORT: "8000"
+    volumes:
+      - /opt/whisper-service/cache/huggingface:/root/.cache/huggingface
+      - /opt/whisper-service/cache/whisper:/root/.cache/whisper
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_SLOT_1_DEVICE:-0}"]
+              capabilities: [gpu]
+
+  whisper-gpu-2:
+    profiles: ["gpu-workers"]
+    image: whisper-service:latest
+    container_name: whisper-service-gpu-2
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    env_file:
+      - "${WHISPER_ENV_FILE:-/opt/whisper-service/.env}"
+    environment:
+      WHISPER_HOST: "0.0.0.0"
+      WHISPER_PORT: "8000"
+    volumes:
+      - /opt/whisper-service/cache/huggingface:/root/.cache/huggingface
+      - /opt/whisper-service/cache/whisper:/root/.cache/whisper
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_SLOT_2_DEVICE:-1}"]
+              capabilities: [gpu]
