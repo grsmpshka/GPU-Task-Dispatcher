@@ -2,6 +2,7 @@
 Description=Ollama GPU worker %i
 After=network-online.target
 Wants=network-online.target
+Conflicts=ollama.service
 
 [Service]
 Type=simple

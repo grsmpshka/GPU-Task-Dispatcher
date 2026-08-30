@@ -37,6 +37,9 @@ OLLAMA_RELEASE_DELAY = max(0.0, float(os.getenv("GPU_OLLAMA_RELEASE_DELAY_SECOND
 JOB_HISTORY_LIMIT = max(1000, int(os.getenv("GPU_JOB_HISTORY_LIMIT", "100000")))
 JOB_PAYLOAD_MAX_BYTES = max(1024, int(os.getenv("GPU_JOB_PAYLOAD_MAX_BYTES", "524288")))
 TASK_IDLE_SECONDS = max(0.1, float(os.getenv("GPU_TASK_IDLE_SECONDS", "10")))
+WORKER_FAILURE_COOLDOWN = max(
+    1.0, float(os.getenv("GPU_WORKER_FAILURE_COOLDOWN_SECONDS", "60"))
+)
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
@@ -335,6 +338,10 @@ class GpuWorkerSlot:
     batch_kind: str | None = None
     batch_started: float = 0.0
     batch_count: int = 0
+    unavailable_until: float = 0.0
+    cooldown_release: asyncio.Task[None] | None = None
+    last_error: str = ""
+    failure_count: int = 0
 
 
 class FairGpuQueue:
@@ -344,10 +351,12 @@ class FairGpuQueue:
         self,
         journal: Journal,
         task_idle_seconds: float = TASK_IDLE_SECONDS,
+        worker_failure_cooldown: float = WORKER_FAILURE_COOLDOWN,
         workers: list[GpuWorkerConfig] | None = None,
     ):
         self.journal = journal
         self.task_idle_seconds = max(0.0, task_idle_seconds)
+        self.worker_failure_cooldown = max(0.01, worker_failure_cooldown)
         self._guard = asyncio.Lock()
         self._pending: deque[Ticket] = deque()
         worker_configs = workers or GPU_WORKERS
@@ -428,6 +437,57 @@ class FairGpuQueue:
             self._schedule_locked()
             self._arm_idle_owners_locked()
 
+    async def mark_worker_unhealthy(self, worker_id: str | None, error: str) -> None:
+        """Temporarily remove a failed slot and release its sticky task mapping."""
+        if worker_id is None:
+            return
+        async with self._guard:
+            slot = self._workers.get(worker_id)
+            if slot is None:
+                return
+            slot.failure_count += 1
+            slot.last_error = error.strip()[:300] or "GPU worker failed"
+            slot.unavailable_until = max(
+                slot.unavailable_until,
+                time.monotonic() + self.worker_failure_cooldown,
+            )
+            self._clear_task_owner_locked(slot)
+            if slot.cooldown_release is not None:
+                slot.cooldown_release.cancel()
+            slot.cooldown_release = asyncio.create_task(
+                self._restore_worker_after_cooldown(slot.config.id)
+            )
+            self._schedule_locked()
+            self._arm_idle_owners_locked()
+
+    async def mark_worker_healthy(self, worker_id: str | None) -> None:
+        if worker_id is None:
+            return
+        async with self._guard:
+            slot = self._workers.get(worker_id)
+            if slot is None:
+                return
+            slot.last_error = ""
+            slot.failure_count = 0
+
+    async def _restore_worker_after_cooldown(self, worker_id: str) -> None:
+        try:
+            while True:
+                async with self._guard:
+                    slot = self._workers.get(worker_id)
+                    if slot is None:
+                        return
+                    delay = slot.unavailable_until - time.monotonic()
+                    if delay <= 0:
+                        slot.unavailable_until = 0.0
+                        slot.cooldown_release = None
+                        self._schedule_locked()
+                        self._arm_idle_owners_locked()
+                        return
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
     async def cancel(self, job_id: str) -> str:
         """Cancel a live request and immediately remove pending work."""
         async with self._guard:
@@ -459,7 +519,7 @@ class FairGpuQueue:
         while self._pending:
             made_progress = False
             for slot in self._workers.values():
-                if slot.active is not None:
+                if slot.active is not None or slot.unavailable_until > time.monotonic():
                     continue
                 selected: Ticket | None = None
                 if slot.task_owner is not None:
@@ -576,6 +636,7 @@ class FairGpuQueue:
         active_jobs = []
         task_owners = []
         workers = []
+        now = time.monotonic()
         for slot in self._workers.values():
             release_in_ms = None
             if slot.task_owner_release_at is not None:
@@ -604,6 +665,12 @@ class FairGpuQueue:
             workers.append({
                 "id": slot.config.id,
                 "label": slot.config.label,
+                "available": slot.unavailable_until <= now,
+                "cooldown_remaining_ms": max(
+                    0, int((slot.unavailable_until - now) * 1000)
+                ),
+                "last_error": slot.last_error,
+                "failure_count": slot.failure_count,
                 "busy": slot.active is not None,
                 "task_owner": owner,
                 "batch_kind": slot.batch_kind,
@@ -753,9 +820,17 @@ async def proxy(request: Request, kind: str) -> Response:
                 # to journal even though the binary audio request is not.
                 response_payload=upstream.content,
             )
+            if upstream.status_code >= 500:
+                await queue.mark_worker_unhealthy(
+                    ticket.worker_id, f"{kind.upper()} upstream returned HTTP {upstream.status_code}"
+                )
+                response_headers.setdefault("Retry-After", "5")
+            else:
+                await queue.mark_worker_healthy(ticket.worker_id)
             return Response(upstream.content, status_code=upstream.status_code, headers=response_headers)
     except Exception as exc:
         logger.exception("GPU job %s failed", ticket.id)
+        await queue.mark_worker_unhealthy(ticket.worker_id, str(exc))
         error_payload = json.dumps(
             {"detail": "GPU task failed", "error": str(exc), "gpu_job_id": ticket.id},
             ensure_ascii=False,
@@ -780,6 +855,9 @@ async def proxy(request: Request, kind: str) -> Response:
 
 @app.get("/health")
 async def health() -> dict[str, object]:
+    runtime_workers = {
+        item["id"]: item for item in queue.snapshot().get("workers", [])
+    }
     async with httpx.AsyncClient(timeout=5) as client:
         worker_health = []
         for worker in GPU_WORKERS:
@@ -788,12 +866,17 @@ async def health() -> dict[str, object]:
                 ollama_ok = (await client.get(f"{worker.ollama_url}/api/tags")).is_success
             with contextlib.suppress(Exception):
                 whisper_ok = (await client.get(f"{worker.whisper_url}/health")).is_success
+            runtime = runtime_workers.get(worker.id, {})
+            runtime_available = bool(runtime.get("available", True))
             worker_health.append({
                 "id": worker.id,
                 "label": worker.label,
                 "ollama": ollama_ok,
                 "whisper": whisper_ok,
-                "available": ollama_ok and whisper_ok,
+                "runtime_available": runtime_available,
+                "cooldown_remaining_ms": runtime.get("cooldown_remaining_ms", 0),
+                "last_error": runtime.get("last_error", ""),
+                "available": ollama_ok and whisper_ok and runtime_available,
             })
     all_ok = all(item["available"] for item in worker_health)
     return {

@@ -223,8 +223,12 @@ async function refreshQueue() {
     const r = await fetch(`/api/gpu-queue?${queueQuery()}`, {cache:'no-store'});
     const d = await r.json();
     const workerCount = Array.isArray(d.workers) ? d.workers.length : 1;
-    $('queue-state').textContent = d.available ? `диспетчер работает · GPU: ${workerCount}` : 'диспетчер недоступен';
-    $('queue-state').className = d.available ? 'pill accent' : 'pill bad';
+    const unavailableWorkers = (d.workers || []).filter(worker => worker.available === false);
+    const availableWorkerCount = Math.max(0, workerCount - unavailableWorkers.length);
+    $('queue-state').textContent = d.available
+      ? (unavailableWorkers.length ? `доступно GPU: ${availableWorkerCount} из ${workerCount}` : `диспетчер работает · GPU: ${workerCount}`)
+      : 'диспетчер недоступен';
+    $('queue-state').className = d.available && !unavailableWorkers.length ? 'pill accent' : 'pill bad';
     $('queue-count').textContent = `ожидают задач: ${d.queued_tasks ?? d.queued ?? 0}`;
     const activeJobs = Array.isArray(d.active_jobs) ? d.active_jobs : (d.active ? [d.active] : []);
     const idleOwners = (Array.isArray(d.task_owners) ? d.task_owners : (d.task_owner ? [d.task_owner] : [])).filter(owner => owner.idle);
@@ -239,7 +243,11 @@ async function refreshQueue() {
       ].join('');
     } else {
       $('queue-active').className = 'queue-active idle';
-      $('queue-active').innerHTML = '<b>GPU свободен</b><div class="muted">Активных задач нет</div>';
+      const warnings = unavailableWorkers.map(worker => {
+        const seconds = Math.max(1, Math.ceil(Number(worker.cooldown_remaining_ms || 0) / 1000));
+        return `<div class="muted warn">${workerLabel(worker)} временно исключена · повторная проверка через ${seconds} с</div>`;
+      }).join('');
+      $('queue-active').innerHTML = `<b>GPU свободен</b><div class="muted">Активных задач нет</div>${warnings}`;
     }
     const groups = Object.entries(d.by_service_kind || {});
     rows($('queue-services'), groups, ([key,count]) => {

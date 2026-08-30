@@ -287,6 +287,77 @@ def test_business_task_stays_on_its_assigned_gpu_worker():
         asyncio.run(scenario(Path(directory)))
 
 
+def test_failed_worker_is_skipped_for_business_task_retry():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        workers = [
+            module.GpuWorkerConfig("gpu-1", "GPU 1", "http://ollama-1", "http://whisper-1"),
+            module.GpuWorkerConfig("gpu-2", "GPU 2", "http://ollama-2", "http://whisper-2"),
+        ]
+        queue = module.FairGpuQueue(
+            module.Journal(tmp_path / "worker-failover.db"),
+            task_idle_seconds=60,
+            worker_failure_cooldown=1,
+            workers=workers,
+        )
+
+        failed = await queue.acquire(
+            "iz-scribe", "recording-1", "stt", "/v1/audio/transcriptions"
+        )
+        assert failed.worker_id == "gpu-1"
+        await queue.mark_worker_unhealthy(failed.worker_id, "STT upstream returned HTTP 500")
+        await queue.release(failed)
+
+        retry = await queue.acquire(
+            "iz-scribe", "recording-1", "stt", "/v1/audio/transcriptions"
+        )
+        assert retry.worker_id == "gpu-2"
+        state = {item["id"]: item for item in queue.snapshot()["workers"]}
+        assert state["gpu-1"]["available"] is False
+        assert state["gpu-1"]["last_error"] == "STT upstream returned HTTP 500"
+
+        await queue.release(retry)
+        queue.journal._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_worker_automatically_returns_after_failure_cooldown():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        workers = [
+            module.GpuWorkerConfig("gpu-1", "GPU 1", "http://ollama-1", "http://whisper-1")
+        ]
+        queue = module.FairGpuQueue(
+            module.Journal(tmp_path / "worker-recovery.db"),
+            task_idle_seconds=0,
+            worker_failure_cooldown=0.03,
+            workers=workers,
+        )
+
+        failed = await queue.acquire("iz-scribe", "recording-1", "stt", "/v1/audio/transcriptions")
+        await queue.mark_worker_unhealthy(failed.worker_id, "CUDA unavailable")
+        await queue.release(failed)
+        waiter = asyncio.create_task(
+            queue.acquire("iz-scribe", "recording-2", "stt", "/v1/audio/transcriptions")
+        )
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        await asyncio.sleep(0.05)
+        recovered = await waiter
+        assert recovered.worker_id == "gpu-1"
+        assert queue.snapshot()["workers"][0]["available"] is True
+
+        await queue.release(recovered)
+        queue.journal._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
 def test_history_supports_pagination_and_filters():
     with TemporaryDirectory(dir=ROOT) as directory:
         tmp_path = Path(directory)
@@ -430,6 +501,8 @@ def test_monitor_uses_task_id_label():
     assert "active_jobs" in html
     assert "workerLabel" in html
     assert ">GPU</th>" in html
+    assert "unavailableWorkers" in html
+    assert "доступно GPU" in html
 
     detail_html = (ROOT / "monitor" / "app" / "static" / "task.html").read_text(encoding="utf-8")
     assert "Запрос и ответ" in detail_html
