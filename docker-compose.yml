@@ -11,6 +11,7 @@ services:
       WHISPER_URL: "${WHISPER_URL:-http://127.0.0.1:8000}"
       GPU_WORKERS_JSON: '${GPU_WORKERS_JSON:-}'
       GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN}"
+      GPU_SERVICE_CANCEL_TOKENS_JSON: '${GPU_SERVICE_CANCEL_TOKENS_JSON:-{}}'
       GPU_MAX_BATCH_TASKS: "${GPU_MAX_BATCH_TASKS:-12}"
       GPU_MAX_BATCH_SECONDS: "${GPU_MAX_BATCH_SECONDS:-300}"
       GPU_REQUEST_TIMEOUT_SECONDS: "${GPU_REQUEST_TIMEOUT_SECONDS:-10800}"
@@ -19,6 +20,7 @@ services:
       GPU_JOB_PAYLOAD_MAX_BYTES: "${GPU_JOB_PAYLOAD_MAX_BYTES:-524288}"
       GPU_TASK_IDLE_SECONDS: "${GPU_TASK_IDLE_SECONDS:-10}"
       GPU_WORKER_FAILURE_COOLDOWN_SECONDS: "${GPU_WORKER_FAILURE_COOLDOWN_SECONDS:-60}"
+      GPU_DEFAULT_MAX_CONTEXT_TOKENS: "${GPU_DEFAULT_MAX_CONTEXT_TOKENS:-0}"
     volumes:
       - "${GPU_DISPATCHER_DATA_DIR:-/srv/data/gpu-task-dispatcher}:/data"
     healthcheck:
@@ -55,6 +57,48 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  ollama-gpu-1:
+    profiles: ["gpu-workers"]
+    image: "${OLLAMA_IMAGE:-ollama/ollama:0.33.1}"
+    container_name: ollama-gpu-1
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      OLLAMA_HOST: "127.0.0.1:11434"
+      OLLAMA_MODELS: "/root/.ollama/models"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      - /srv/ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_SLOT_1_DEVICE}"]
+              capabilities: [gpu]
+
+  ollama-gpu-2:
+    profiles: ["gpu-workers"]
+    image: "${OLLAMA_IMAGE:-ollama/ollama:0.33.1}"
+    container_name: ollama-gpu-2
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      OLLAMA_HOST: "127.0.0.1:11436"
+      OLLAMA_MODELS: "/root/.ollama/models"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      - /srv/ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_SLOT_2_DEVICE}"]
+              capabilities: [gpu]
 
   whisper-gpu-1:
     profiles: ["gpu-workers"]

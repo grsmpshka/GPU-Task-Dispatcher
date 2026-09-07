@@ -29,6 +29,24 @@ logger = logging.getLogger("gpu-dispatcher")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://127.0.0.1:8000").rstrip("/")
 DISPATCHER_TOKEN = os.getenv("GPU_DISPATCHER_TOKEN", "")
+
+
+def load_service_cancel_tokens() -> dict[str, str]:
+    raw = os.getenv("GPU_SERVICE_CANCEL_TOKENS_JSON", "{}").strip() or "{}"
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid GPU_SERVICE_CANCEL_TOKENS_JSON: {exc}") from exc
+    if not isinstance(values, dict):
+        raise RuntimeError("GPU_SERVICE_CANCEL_TOKENS_JSON must be a JSON object")
+    return {
+        str(service).strip().lower(): str(token)
+        for service, token in values.items()
+        if str(service).strip() and str(token)
+    }
+
+
+SERVICE_CANCEL_TOKENS = load_service_cancel_tokens()
 DATA_PATH = Path(os.getenv("GPU_DISPATCHER_DATA", "/data/dispatcher.db"))
 MAX_BATCH_TASKS = max(1, int(os.getenv("GPU_MAX_BATCH_TASKS", "12")))
 MAX_BATCH_SECONDS = max(1, int(os.getenv("GPU_MAX_BATCH_SECONDS", "300")))
@@ -39,6 +57,9 @@ JOB_PAYLOAD_MAX_BYTES = max(1024, int(os.getenv("GPU_JOB_PAYLOAD_MAX_BYTES", "52
 TASK_IDLE_SECONDS = max(0.1, float(os.getenv("GPU_TASK_IDLE_SECONDS", "10")))
 WORKER_FAILURE_COOLDOWN = max(
     1.0, float(os.getenv("GPU_WORKER_FAILURE_COOLDOWN_SECONDS", "60"))
+)
+DEFAULT_MAX_CONTEXT_TOKENS = max(
+    0, int(os.getenv("GPU_DEFAULT_MAX_CONTEXT_TOKENS", "0"))
 )
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -52,6 +73,8 @@ class GpuWorkerConfig:
     label: str
     ollama_url: str
     whisper_url: str
+    max_context_tokens: int = 0
+    models: tuple[str, ...] = ()
 
 
 def load_worker_configs() -> list[GpuWorkerConfig]:
@@ -81,7 +104,18 @@ def load_worker_configs() -> list[GpuWorkerConfig]:
         if not whisper_url.startswith(("http://", "https://")):
             raise RuntimeError(f"GPU worker {worker_id!r} has an invalid whisper_url")
         label = str(value.get("label") or worker_id).strip()[:80]
-        workers.append(GpuWorkerConfig(worker_id, label, ollama_url, whisper_url))
+        max_context_tokens = max(
+            0, int(value.get("max_context_tokens") or DEFAULT_MAX_CONTEXT_TOKENS)
+        )
+        configured_models = value.get("models") or []
+        if not isinstance(configured_models, list):
+            raise RuntimeError(f"GPU worker {worker_id!r} models must be an array")
+        models = tuple(str(model).strip() for model in configured_models if str(model).strip())
+        workers.append(
+            GpuWorkerConfig(
+                worker_id, label, ollama_url, whisper_url, max_context_tokens, models
+            )
+        )
         seen.add(worker_id)
     return workers
 
@@ -108,6 +142,15 @@ class Journal:
                 run_ms integer, http_status integer, error text
             )"""
         )
+        self._db.execute(
+            """create table if not exists gpu_task_cancellations (
+                service text not null,
+                source_id text not null,
+                requested_at text not null,
+                reason text not null default '',
+                primary key(service, source_id)
+            )"""
+        )
         columns = {row[1] for row in self._db.execute("pragma table_info(gpu_jobs)")}
         if "source_id" not in columns:
             self._db.execute("alter table gpu_jobs add column source_id text")
@@ -130,7 +173,7 @@ class Journal:
         now = utcnow()
         self._db.execute(
             "update gpu_jobs set status='cancelled',completed_at=?,error=? "
-            "where status in ('queued','running')",
+            "where status in ('queued','running','cancellation_pending')",
             (now, "Dispatcher restarted before the task finished"),
         )
         self._db.commit()
@@ -217,7 +260,7 @@ class Journal:
     def _prune_locked(self) -> None:
         self._db.execute(
             "delete from gpu_jobs where id in ("
-            "select id from gpu_jobs where status not in ('queued','running') "
+            "select id from gpu_jobs where status not in ('queued','running','cancellation_pending') "
             "order by queued_at desc limit -1 offset ?)",
             (JOB_HISTORY_LIMIT,),
         )
@@ -226,12 +269,55 @@ class Journal:
         with self._lock:
             cursor = self._db.execute(
                 "update gpu_jobs set status='cancelled',completed_at=?,run_ms=coalesce(?,run_ms),error=? "
-                "where id=? and status in ('queued','running')",
+                "where id=? and status in ('queued','running','cancellation_pending')",
                 (utcnow(), run_ms, error[:1000], job_id),
             )
             self._prune_locked()
             self._db.commit()
             return cursor.rowcount > 0
+
+    def cancellation_pending(self, job_id: str, error: str = "Cancellation requested") -> bool:
+        with self._lock:
+            cursor = self._db.execute(
+                "update gpu_jobs set status='cancellation_pending',error=? "
+                "where id=? and status='running'",
+                (error[:1000], job_id),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    def request_task_cancellation(
+        self, service: str, source_id: str, reason: str = "Cancelled by source service"
+    ) -> dict[str, int]:
+        """Persist a task tombstone and update every unfinished journal row."""
+        now = utcnow()
+        with self._lock:
+            self._db.execute(
+                "insert into gpu_task_cancellations(service,source_id,requested_at,reason) "
+                "values(?,?,?,?) on conflict(service,source_id) do nothing",
+                (service, source_id, now, reason[:1000]),
+            )
+            pending = self._db.execute(
+                "update gpu_jobs set status='cancelled',completed_at=?,error=? "
+                "where service=? and source_id=? and status='queued'",
+                (now, reason[:1000], service, source_id),
+            ).rowcount
+            active = self._db.execute(
+                "update gpu_jobs set status='cancellation_pending',error=? "
+                "where service=? and source_id=? and status='running'",
+                (reason[:1000], service, source_id),
+            ).rowcount
+            self._db.commit()
+            return {"pending": max(0, pending), "active": max(0, active)}
+
+    def is_task_cancelled(self, service: str, source_id: str) -> bool:
+        if not source_id:
+            return False
+        with self._lock:
+            return self._db.execute(
+                "select 1 from gpu_task_cancellations where service=? and source_id=?",
+                (service, source_id),
+            ).fetchone() is not None
 
     @staticmethod
     def _history_filter(
@@ -281,7 +367,7 @@ class Journal:
         """Delete finished journal rows while preserving live queue entries."""
         with self._lock:
             cursor = self._db.execute(
-                "delete from gpu_jobs where status not in ('queued','running')"
+                "delete from gpu_jobs where status not in ('queued','running','cancellation_pending')"
             )
             self._db.commit()
             return max(0, cursor.rowcount)
@@ -307,6 +393,33 @@ class Journal:
         return result
 
 
+class TaskAlreadyCancelled(RuntimeError):
+    pass
+
+
+class UnschedulableRequest(RuntimeError):
+    pass
+
+
+def llm_request_metadata(payload: bytes | None) -> tuple[str, int | None]:
+    if not payload:
+        return "", None
+    try:
+        body = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "", None
+    if not isinstance(body, dict):
+        return "", None
+    model = str(body.get("model") or "").strip()
+    options = body.get("options")
+    raw_num_ctx = options.get("num_ctx") if isinstance(options, dict) else None
+    try:
+        num_ctx = int(raw_num_ctx) if raw_num_ctx is not None else None
+    except (TypeError, ValueError):
+        num_ctx = None
+    return model, num_ctx if num_ctx is None or num_ctx > 0 else None
+
+
 @dataclass
 class Ticket:
     id: str
@@ -320,6 +433,9 @@ class Ticket:
     started_at: float | None = None
     final_request: bool = False
     worker_id: str | None = None
+    model: str = ""
+    num_ctx: int | None = None
+    cancellation_requested: bool = False
 
     @property
     def task_key(self) -> tuple[str, str] | None:
@@ -366,6 +482,7 @@ class FairGpuQueue:
             config.id: GpuWorkerSlot(config) for config in worker_configs
         }
         self._task_workers: dict[tuple[str, str], str] = {}
+        self._last_scheduled_service = ""
 
     def worker(self, worker_id: str | None) -> GpuWorkerConfig:
         if worker_id is None or worker_id not in self._workers:
@@ -389,9 +506,18 @@ class FairGpuQueue:
         request_payload: bytes | None = None,
         final_request: bool = False,
     ) -> Ticket:
+        if source_id and self.journal.is_task_cancelled(service, source_id):
+            raise TaskAlreadyCancelled(f"Task {service}/{source_id} was cancelled")
+        model, num_ctx = llm_request_metadata(request_payload) if kind == "llm" else ("", None)
         ticket = Ticket(uuid.uuid4().hex, service, source_id, kind, route)
         ticket.owner = asyncio.current_task()
         ticket.final_request = final_request
+        ticket.model = model
+        ticket.num_ctx = num_ctx
+        if not any(self._worker_can_run(slot.config, ticket) for slot in self._workers.values()):
+            raise UnschedulableRequest(
+                f"No GPU worker can run model {model or 'default'} with num_ctx={num_ctx or 'default'}"
+            )
         self.journal.queued(
             ticket.id,
             service,
@@ -404,6 +530,19 @@ class FairGpuQueue:
             request_payload=request_payload,
         )
         async with self._guard:
+            if source_id and self.journal.is_task_cancelled(service, source_id):
+                self.journal.cancelled(ticket.id, error="Task was cancelled before queue admission")
+                raise TaskAlreadyCancelled(f"Task {service}/{source_id} was cancelled")
+            assigned_worker = self._task_workers.get(ticket.task_key) if ticket.task_key else None
+            if assigned_worker and not self._worker_can_run(
+                self._workers[assigned_worker].config, ticket
+            ):
+                self.journal.cancelled(
+                    ticket.id, error="Assigned GPU cannot satisfy model/context requirements"
+                )
+                raise UnschedulableRequest(
+                    "The GPU reserved by this task cannot satisfy the requested model/context"
+                )
             self._pending.append(ticket)
             self._schedule_locked()
         try:
@@ -419,6 +558,12 @@ class FairGpuQueue:
                 self._arm_idle_owners_locked()
             self.journal.cancelled(ticket.id, error="Request cancelled while waiting")
             raise
+        if ticket.cancellation_requested or (
+            ticket.source_id and self.journal.is_task_cancelled(ticket.service, ticket.source_id)
+        ):
+            self.journal.cancelled(ticket.id, error="Task cancelled before upstream start")
+            await self.release(ticket)
+            raise TaskAlreadyCancelled(f"Task {ticket.service}/{ticket.source_id} was cancelled")
         ticket.started_at = time.monotonic()
         self.journal.running(
             ticket.id,
@@ -427,12 +572,28 @@ class FairGpuQueue:
         )
         return ticket
 
+    @staticmethod
+    def _worker_can_run(config: GpuWorkerConfig, ticket: Ticket) -> bool:
+        if ticket.kind != "llm":
+            return True
+        if config.models and ticket.model and ticket.model not in config.models:
+            return False
+        return not (
+            config.max_context_tokens
+            and ticket.num_ctx
+            and ticket.num_ctx > config.max_context_tokens
+        )
+
     async def release(self, ticket: Ticket) -> None:
         async with self._guard:
             slot = self._slot_for_ticket(ticket)
             if slot is not None and slot.active is ticket:
                 slot.active = None
-            if slot is not None and ticket.final_request and ticket.task_key == slot.task_owner:
+            if (
+                slot is not None
+                and (ticket.final_request or ticket.cancellation_requested)
+                and ticket.task_key == slot.task_owner
+            ):
                 self._clear_task_owner_locked(slot)
             self._schedule_locked()
             self._arm_idle_owners_locked()
@@ -489,7 +650,7 @@ class FairGpuQueue:
             return
 
     async def cancel(self, job_id: str) -> str:
-        """Cancel a live request and immediately remove pending work."""
+        """Cancel a queued request or suppress the result of an active request."""
         async with self._guard:
             ticket = next((item for item in self._pending if item.id == job_id), None)
             was_pending = ticket is not None
@@ -503,17 +664,47 @@ class FairGpuQueue:
                 )
             if ticket is None:
                 return "not_found"
-
-            run_ms = None
-            if ticket.started_at is not None:
-                run_ms = int((time.monotonic() - ticket.started_at) * 1000)
-            self.journal.cancelled(ticket.id, run_ms)
-            if ticket.owner is not None and not ticket.owner.done():
-                ticket.owner.cancel()
             if was_pending:
+                self.journal.cancelled(ticket.id)
+                if ticket.owner is not None and not ticket.owner.done():
+                    ticket.owner.cancel()
                 self._schedule_locked()
                 self._arm_idle_owners_locked()
-            return "cancelled"
+                return "cancelled"
+            ticket.cancellation_requested = True
+            self.journal.cancellation_pending(ticket.id)
+            return "cancellation_pending"
+
+    async def cancel_task(self, service: str, source_id: str, reason: str = "") -> dict[str, object]:
+        """Persistently cancel a business task without releasing a busy GPU early."""
+        key = (service, source_id)
+        message = reason.strip()[:1000] or "Cancelled by source service"
+        journal_counts = self.journal.request_task_cancellation(service, source_id, message)
+        cancelled_pending = 0
+        active_jobs = 0
+        async with self._guard:
+            for ticket in list(self._pending):
+                if ticket.task_key != key:
+                    continue
+                self._pending.remove(ticket)
+                cancelled_pending += 1
+                if ticket.owner is not None and not ticket.owner.done():
+                    ticket.owner.cancel()
+            for slot in self._workers.values():
+                if slot.active is not None and slot.active.task_key == key:
+                    slot.active.cancellation_requested = True
+                    active_jobs += 1
+                if slot.task_owner == key and slot.active is None:
+                    self._clear_task_owner_locked(slot)
+            self._schedule_locked()
+            self._arm_idle_owners_locked()
+        return {
+            "status": "cancellation_pending" if active_jobs else "cancelled",
+            "service": service,
+            "source_id": source_id,
+            "cancelled_pending_requests": max(cancelled_pending, journal_counts["pending"]),
+            "active_jobs": active_jobs,
+        }
 
     def _schedule_locked(self) -> None:
         while self._pending:
@@ -524,18 +715,33 @@ class FairGpuQueue:
                 selected: Ticket | None = None
                 if slot.task_owner is not None:
                     selected = next(
-                        (item for item in self._pending if item.task_key == slot.task_owner),
+                        (
+                            item for item in self._pending
+                            if item.task_key == slot.task_owner
+                            and self._worker_can_run(slot.config, item)
+                        ),
                         None,
                     )
                     if selected is None:
                         continue
                     self._cancel_task_owner_release_locked(slot)
                 else:
+                    eligible: list[Ticket] = []
                     for item in self._pending:
                         assigned = self._task_workers.get(item.task_key) if item.task_key else None
-                        if assigned is None or assigned == slot.config.id:
-                            selected = item
-                            break
+                        if (
+                            (assigned is None or assigned == slot.config.id)
+                            and self._worker_can_run(slot.config, item)
+                        ):
+                            eligible.append(item)
+                    if eligible:
+                        selected = next(
+                            (
+                                item for item in eligible
+                                if item.service != self._last_scheduled_service
+                            ),
+                            eligible[0],
+                        )
                     if selected is None:
                         continue
                     if selected.task_key is not None:
@@ -550,6 +756,7 @@ class FairGpuQueue:
                 slot.active = selected
                 slot.batch_count += 1
                 selected.worker_id = slot.config.id
+                self._last_scheduled_service = selected.service
                 selected.ready.set()
                 made_progress = True
             if not made_progress:
@@ -649,6 +856,9 @@ class FairGpuQueue:
                 "route": slot.active.route,
                 "worker_id": slot.config.id,
                 "worker_label": slot.config.label,
+                "model": slot.active.model,
+                "num_ctx": slot.active.num_ctx,
+                "cancellation_pending": slot.active.cancellation_requested,
             }
             if active is not None:
                 active_jobs.append(active)
@@ -693,6 +903,8 @@ class FairGpuQueue:
                     "source_id": item.source_id,
                     "kind": item.kind,
                     "route": item.route,
+                    "model": item.model,
+                    "num_ctx": item.num_ctx,
                 }
                 for item in self._pending
             ],
@@ -770,21 +982,54 @@ def final_request(request: Request) -> bool:
 
 async def proxy(request: Request, kind: str) -> Response:
     service = service_name(request)
+    external_source_id = source_id(request)
+    if external_source_id and journal.is_task_cancelled(service, external_source_id):
+        return JSONResponse(
+            status_code=410,
+            content={
+                "detail": "GPU task was cancelled",
+                "code": "task_cancelled",
+                "service": service,
+                "source_id": external_source_id,
+                "retryable": False,
+            },
+        )
     # LLM payloads are textual JSON and useful for later diagnostics. Whisper
     # requests contain large binary audio, so they deliberately remain streamed
     # and are never copied into the journal.
     request_payload = await request.body() if kind == "llm" else None
-    ticket = await queue.acquire(
-        service,
-        source_id(request),
-        kind,
-        request.url.path,
-        method=request.method,
-        query=request.url.query,
-        request_content_type=request.headers.get("content-type", ""),
-        request_payload=request_payload,
-        final_request=final_request(request),
-    )
+    try:
+        ticket = await queue.acquire(
+            service,
+            external_source_id,
+            kind,
+            request.url.path,
+            method=request.method,
+            query=request.url.query,
+            request_content_type=request.headers.get("content-type", ""),
+            request_payload=request_payload,
+            final_request=final_request(request),
+        )
+    except TaskAlreadyCancelled:
+        return JSONResponse(
+            status_code=410,
+            content={
+                "detail": "GPU task was cancelled",
+                "code": "task_cancelled",
+                "service": service,
+                "source_id": external_source_id,
+                "retryable": False,
+            },
+        )
+    except UnschedulableRequest as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": str(exc),
+                "code": "gpu_request_not_supported",
+                "retryable": False,
+            },
+        )
     started = time.monotonic()
     status_code: int | None = None
     try:
@@ -810,6 +1055,32 @@ async def proxy(request: Request, kind: str) -> Response:
                 key: value for key, value in upstream.headers.items()
                 if key.lower() not in HOP_HEADERS
             }
+            if upstream.status_code >= 500:
+                await queue.mark_worker_unhealthy(
+                    ticket.worker_id, f"{kind.upper()} upstream returned HTTP {upstream.status_code}"
+                )
+                response_headers.setdefault("Retry-After", "5")
+            else:
+                await queue.mark_worker_healthy(ticket.worker_id)
+            if ticket.cancellation_requested or journal.is_task_cancelled(
+                ticket.service, ticket.source_id
+            ):
+                journal.finished(
+                    ticket.id,
+                    "cancelled",
+                    int((time.monotonic() - started) * 1000),
+                    409,
+                    "Upstream finished after cancellation; result discarded",
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "detail": "GPU task was cancelled; late result was discarded",
+                        "code": "task_cancelled",
+                        "gpu_job_id": ticket.id,
+                        "retryable": False,
+                    },
+                )
             journal.finished(
                 ticket.id,
                 "completed" if upstream.status_code < 500 else "failed",
@@ -820,17 +1091,29 @@ async def proxy(request: Request, kind: str) -> Response:
                 # to journal even though the binary audio request is not.
                 response_payload=upstream.content,
             )
-            if upstream.status_code >= 500:
-                await queue.mark_worker_unhealthy(
-                    ticket.worker_id, f"{kind.upper()} upstream returned HTTP {upstream.status_code}"
-                )
-                response_headers.setdefault("Retry-After", "5")
-            else:
-                await queue.mark_worker_healthy(ticket.worker_id)
             return Response(upstream.content, status_code=upstream.status_code, headers=response_headers)
     except Exception as exc:
         logger.exception("GPU job %s failed", ticket.id)
         await queue.mark_worker_unhealthy(ticket.worker_id, str(exc))
+        if ticket.cancellation_requested or journal.is_task_cancelled(
+            ticket.service, ticket.source_id
+        ):
+            journal.finished(
+                ticket.id,
+                "cancelled",
+                int((time.monotonic() - started) * 1000),
+                409,
+                "Task cancelled; upstream result unavailable",
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "GPU task was cancelled",
+                    "code": "task_cancelled",
+                    "gpu_job_id": ticket.id,
+                    "retryable": False,
+                },
+            )
         error_payload = json.dumps(
             {"detail": "GPU task failed", "error": str(exc), "gpu_job_id": ticket.id},
             ensure_ascii=False,
@@ -925,6 +1208,54 @@ async def clear_queue_history(request: Request) -> JSONResponse:
     return JSONResponse(content={"status": "cleared", "deleted": deleted})
 
 
+def service_cancel_authorized(request: Request, service: str) -> bool:
+    expected = SERVICE_CANCEL_TOKENS.get(service)
+    authorization = request.headers.get("authorization", "")
+    bearer = authorization[7:] if authorization.lower().startswith("bearer ") else ""
+    if expected and bearer and secrets.compare_digest(bearer, expected):
+        return True
+    supplied_admin = request.headers.get("x-gpu-dispatcher-token", "")
+    return bool(
+        DISPATCHER_TOKEN
+        and supplied_admin
+        and secrets.compare_digest(supplied_admin, DISPATCHER_TOKEN)
+    )
+
+
+@app.post("/queue/cancel")
+async def cancel_business_task(request: Request) -> JSONResponse:
+    service = request.headers.get("x-gpu-service", "").strip().lower()
+    external_source_id = request.headers.get("x-gpu-source-id", "").strip()
+    if (
+        not service
+        or len(service) > 80
+        or not all(char.isalnum() or char in "-_." for char in service)
+        or not external_source_id
+        or len(external_source_id) > 160
+        or not all(char.isalnum() or char in "-_:." for char in external_source_id)
+    ):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Valid X-GPU-Service and X-GPU-Source-ID are required"},
+        )
+    if not service_cancel_authorized(request, service):
+        return JSONResponse(status_code=401, content={"detail": "Invalid cancellation token"})
+    reason = ""
+    if request.headers.get("content-length", "0") not in {"", "0"}:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse(status_code=400, content={"detail": "Request body must be JSON"})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"detail": "Request body must be an object"})
+        reason = str(body.get("reason") or "")
+    result = await queue.cancel_task(service, external_source_id, reason)
+    return JSONResponse(
+        status_code=202 if result["status"] == "cancellation_pending" else 200,
+        content=result,
+    )
+
+
 @app.get("/queue/{job_id}")
 async def queue_job_detail(job_id: str) -> JSONResponse:
     detail = journal.detail(job_id)
@@ -943,7 +1274,10 @@ async def cancel_job(job_id: str, request: Request) -> JSONResponse:
     result = await queue.cancel(job_id)
     if result == "not_found":
         return JSONResponse(status_code=404, content={"detail": "Task is not active or queued"})
-    return JSONResponse(content={"status": result, "job_id": job_id})
+    return JSONResponse(
+        status_code=202 if result == "cancellation_pending" else 200,
+        content={"status": result, "job_id": job_id},
+    )
 
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])

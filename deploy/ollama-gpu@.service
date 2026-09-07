@@ -9,7 +9,7 @@ Type=simple
 User=ollama
 Group=ollama
 EnvironmentFile=/etc/gpu-task-dispatcher/ollama-%i.env
-ExecStart=/usr/local/bin/ollama serve
+ExecStart=/usr/local/bin/ollama-gpu-launch /usr/local/bin/ollama serve
 Restart=always
 RestartSec=3
 

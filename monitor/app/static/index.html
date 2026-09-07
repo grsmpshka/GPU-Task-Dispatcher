@@ -52,7 +52,7 @@ main { max-width:1400px; margin:auto; padding:24px }
 .page-size select { border:0; background:transparent; color:var(--muted); padding:0; font:inherit; cursor:pointer }
 .page-size option { background:#121821; color:#eef3f8 }
 .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:7px; background:var(--muted) }
-.status-dot.running { background:var(--accent) }.status-dot.completed { background:var(--accent2) }.status-dot.failed { background:#ff7b7b }.status-dot.queued { background:#ffd166 }.status-dot.cancelled { background:var(--muted) }
+.status-dot.running { background:var(--accent) }.status-dot.cancellation_pending { background:var(--warn) }.status-dot.completed { background:var(--accent2) }.status-dot.failed { background:#ff7b7b }.status-dot.queued { background:#ffd166 }.status-dot.cancelled { background:var(--muted) }
 .full { grid-column:1/-1 }
 .empty { color:var(--muted); padding:8px 0 }
 .chart-wrap { width:100%; height:220px }
@@ -88,7 +88,7 @@ code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all;
             <input id="filter-source" placeholder="ID задачи" oninput="scheduleQueueFilter()">
             <input id="filter-service" placeholder="Сервис" oninput="scheduleQueueFilter()">
             <select id="filter-kind" onchange="applyQueueFilters()"><option value="">Все нагрузки</option><option value="llm">Qwen</option><option value="stt">Whisper</option></select>
-            <select id="filter-status" onchange="applyQueueFilters()"><option value="">Все статусы</option><option value="running">Выполняется</option><option value="queued">В очереди</option><option value="completed">Готово</option><option value="failed">Ошибка</option><option value="cancelled">Остановлено</option></select>
+            <select id="filter-status" onchange="applyQueueFilters()"><option value="">Все статусы</option><option value="running">Выполняется</option><option value="cancellation_pending">Останавливается</option><option value="queued">В очереди</option><option value="completed">Готово</option><option value="failed">Ошибка</option><option value="cancelled">Остановлено</option></select>
             <button class="secondary-btn" onclick="resetQueueFilters()">Сбросить</button>
           </div>
           <div id="queue-recent"></div>
@@ -139,7 +139,7 @@ function rows(el, items, fn){
 const palette = ['#67e8a5','#67b8e8','#e8a567','#c67ee8','#e86767'];
 const serviceNames = {'iz-scribe':'IZ.Scribe','privacy-gateway':'Privacy Gateway','unregistered':'Неизвестный сервис'};
 const kindNames = {llm:'Qwen',stt:'Whisper'};
-const statusNames = {running:'Выполняется',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
+const statusNames = {running:'Выполняется',cancellation_pending:'Останавливается',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
 const serviceLabel = s => serviceNames[s] || s;
 const kindLabel = k => kindNames[k] || k;
 const workerLabel = job => job.worker_label || job.worker_id || 'GPU';
@@ -235,7 +235,7 @@ async function refreshQueue() {
     if (activeJobs.length || idleOwners.length) {
       $('queue-active').className = 'queue-active';
       $('queue-active').innerHTML = [
-        ...activeJobs.map(job => `<div class="queue-active-line"><div><b><span class="status-dot running"></span>${workerLabel(job)} · ${serviceLabel(job.service)} · ${kindLabel(job.kind)}</b><div class="muted">${job.route} · ID задачи: ${sourceId(job.source_id)}</div></div><button class="stop-btn" data-job-id="${job.id}" onclick="stopJob('${job.id}')">Остановить</button></div>`),
+        ...activeJobs.map(job => `<div class="queue-active-line"><div><b><span class="status-dot ${job.cancellation_pending?'cancellation_pending':'running'}"></span>${workerLabel(job)} · ${serviceLabel(job.service)} · ${kindLabel(job.kind)}${job.cancellation_pending?' · останавливается':''}</b><div class="muted">${job.route} · ID задачи: ${sourceId(job.source_id)}${job.num_ctx?` · контекст: ${job.num_ctx}`:''}</div></div><button class="stop-btn" data-job-id="${job.id}" ${job.cancellation_pending?'disabled':''} onclick="stopJob('${job.id}')">${job.cancellation_pending?'Ожидание':'Остановить'}</button></div>`),
         ...idleOwners.map(owner => {
           const seconds = owner.release_in_ms == null ? '' : ` · освобождение через ${Math.max(1,Math.ceil(owner.release_in_ms/1000))} с`;
           return `<div class="queue-active-line"><div><b><span class="status-dot queued"></span>${workerLabel(owner)} · ${serviceLabel(owner.service)} · задача удерживает слот</b><div class="muted">ID задачи: ${sourceId(owner.source_id)}${seconds}</div></div></div>`;

@@ -15,7 +15,7 @@ header { min-height:72px; padding:16px 28px; border-bottom:1px solid var(--line)
 .title h1 { margin:0; font-size:19px }
 .title code { display:block; color:var(--muted); font-size:11px; overflow-wrap:anywhere; word-break:break-all }
 .status { padding:5px 10px; border-radius:999px; background:#1c2934; color:var(--muted); font-size:12px; white-space:nowrap }
-.status.completed { color:var(--blue); background:#102a38 }.status.running { color:var(--accent); background:#12301f }.status.failed { color:var(--danger); background:#391d1d }.status.queued { color:var(--warn); background:#342b12 }
+.status.completed { color:var(--blue); background:#102a38 }.status.running { color:var(--accent); background:#12301f }.status.cancellation_pending { color:var(--warn); background:#342b12 }.status.failed { color:var(--danger); background:#391d1d }.status.queued { color:var(--warn); background:#342b12 }
 main { max-width:1800px; margin:auto; padding:22px 28px 30px }
 .meta { display:grid; grid-template-columns:repeat(7,minmax(120px,1fr)); gap:10px; margin-bottom:14px }
 .meta-item { background:var(--card); border:1px solid var(--line); border-radius:11px; padding:10px 12px; min-width:0 }
@@ -91,7 +91,7 @@ pre { flex:1; margin:0; padding:16px; overflow:auto; background:var(--panel); co
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const statusNames = {running:'Выполняется',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
+const statusNames = {running:'Выполняется',cancellation_pending:'Останавливается',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
 const serviceNames = {'iz-scribe':'IZ.Scribe','privacy-gateway':'Privacy Gateway','unregistered':'Неизвестный сервис'};
 const kindNames = {llm:'Qwen',stt:'Whisper'};
 let job = null;

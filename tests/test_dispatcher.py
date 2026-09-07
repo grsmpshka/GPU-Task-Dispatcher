@@ -4,8 +4,11 @@ import importlib.util
 import asyncio
 import os
 import sys
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -84,7 +87,7 @@ def test_pending_job_can_be_cancelled_and_removed():
         asyncio.run(scenario(Path(directory)))
 
 
-def test_active_job_cancel_schedules_next_job():
+def test_active_job_cancel_waits_for_upstream_before_releasing_worker():
     async def scenario(tmp_path: Path):
         module = load_dispatcher(tmp_path)
         queue = module.FairGpuQueue(module.Journal(tmp_path / "queue.db"), task_idle_seconds=0)
@@ -104,13 +107,190 @@ def test_active_job_cancel_schedules_next_job():
         await asyncio.sleep(0)
         active_id = queue.snapshot()["active"]["id"]
 
-        assert await queue.cancel(active_id) == "cancelled"
+        assert await queue.cancel(active_id) == "cancellation_pending"
         await asyncio.sleep(0)
-        assert active_task.cancelled()
+        assert not active_task.cancelled()
+        assert not waiter.done()
+        assert queue.snapshot()["active"]["cancellation_pending"] is True
+
+        active_task.cancel()
+        try:
+            await active_task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
         second = await waiter
         assert queue.snapshot()["active"]["source_id"] == "task-2"
 
         await queue.release(second)
+        queue.journal._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_business_task_cancellation_is_persistent_idempotent_and_service_scoped():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        db_path = tmp_path / "task-cancel.db"
+        history = module.Journal(db_path)
+        queue = module.FairGpuQueue(history, task_idle_seconds=0)
+
+        active = await queue.acquire("privacy-gateway", "same-id", "llm", "/api/chat")
+        waiting = asyncio.create_task(
+            queue.acquire("privacy-gateway", "same-id", "llm", "/api/chat")
+        )
+        other_service = asyncio.create_task(
+            queue.acquire("iz-scribe", "same-id", "stt", "/v1/audio/transcriptions")
+        )
+        await asyncio.sleep(0)
+
+        first = await queue.cancel_task("privacy-gateway", "same-id")
+        second = await queue.cancel_task("privacy-gateway", "same-id")
+        assert first["status"] == "cancellation_pending"
+        assert first["cancelled_pending_requests"] == 1
+        assert second["status"] == "cancellation_pending"
+        assert active.cancellation_requested is True
+        await asyncio.sleep(0)
+        assert waiting.cancelled()
+        assert not other_service.done()
+
+        try:
+            await queue.acquire("privacy-gateway", "same-id", "llm", "/api/chat")
+            raise AssertionError("late fragment was accepted")
+        except module.TaskAlreadyCancelled:
+            pass
+
+        await queue.release(active)
+        other = await other_service
+        await queue.release(other)
+
+        recovered = module.Journal(db_path)
+        assert recovered.is_task_cancelled("privacy-gateway", "same-id") is True
+        assert recovered.is_task_cancelled("iz-scribe", "same-id") is False
+
+        history._db.close()
+        recovered._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_num_ctx_is_preserved_and_checked_against_worker_capacity():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        worker = module.GpuWorkerConfig(
+            "gpu-1", "GPU 1", "http://ollama-1", "http://whisper-1", 16384,
+            ("qwen3.6:27b",),
+        )
+        queue = module.FairGpuQueue(
+            module.Journal(tmp_path / "context.db"), task_idle_seconds=0, workers=[worker]
+        )
+        payload = b'{"model":"qwen3.6:27b","options":{"num_ctx":16384}}'
+        ticket = await queue.acquire(
+            "privacy-gateway", "document-1", "llm", "/api/chat", request_payload=payload
+        )
+        assert ticket.model == "qwen3.6:27b"
+        assert ticket.num_ctx == 16384
+        assert queue.journal.detail(ticket.id)["request_payload"] == payload.decode()
+        await queue.release(ticket)
+
+        oversized = b'{"model":"qwen3.6:27b","options":{"num_ctx":32768}}'
+        try:
+            await queue.acquire(
+                "privacy-gateway", "document-2", "llm", "/api/chat",
+                request_payload=oversized,
+            )
+            raise AssertionError("oversized context was accepted")
+        except module.UnschedulableRequest:
+            pass
+
+        queue.journal._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_business_cancel_endpoint_requires_service_specific_token():
+    async def scenario(tmp_path: Path):
+        previous = os.environ.get("GPU_SERVICE_CANCEL_TOKENS_JSON")
+        os.environ["GPU_SERVICE_CANCEL_TOKENS_JSON"] = json.dumps(
+            {"privacy-gateway": "pg-secret", "iz-scribe": "iz-secret"}
+        )
+        try:
+            module = load_dispatcher(tmp_path)
+            transport = httpx.ASGITransport(app=module.app)
+            headers = {
+                "X-GPU-Service": "privacy-gateway",
+                "X-GPU-Source-ID": "document-42",
+            }
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                unauthorized = await client.post("/queue/cancel", headers=headers, json={})
+                wrong_service = await client.post(
+                    "/queue/cancel",
+                    headers={**headers, "Authorization": "Bearer iz-secret"},
+                    json={},
+                )
+                accepted = await client.post(
+                    "/queue/cancel",
+                    headers={**headers, "Authorization": "Bearer pg-secret"},
+                    json={"reason": "Cancelled in PG"},
+                )
+                repeated = await client.post(
+                    "/queue/cancel",
+                    headers={**headers, "Authorization": "Bearer pg-secret"},
+                    json={},
+                )
+                late = await client.post(
+                    "/api/chat",
+                    headers=headers,
+                    json={"model": "qwen3.6:27b", "options": {"num_ctx": 16384}},
+                )
+
+            assert unauthorized.status_code == 401
+            assert wrong_service.status_code == 401
+            assert accepted.status_code == 200
+            assert accepted.json()["status"] == "cancelled"
+            assert repeated.status_code == 200
+            assert late.status_code == 410
+            assert late.json()["code"] == "task_cancelled"
+            module.journal._db.close()
+        finally:
+            if previous is None:
+                os.environ.pop("GPU_SERVICE_CANCEL_TOKENS_JSON", None)
+            else:
+                os.environ["GPU_SERVICE_CANCEL_TOKENS_JSON"] = previous
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_scheduler_alternates_services_when_both_are_waiting():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        queue = module.FairGpuQueue(module.Journal(tmp_path / "fair.db"), task_idle_seconds=0)
+        current = await queue.acquire(
+            "privacy-gateway", "task-current", "llm", "/api/chat", final_request=True
+        )
+        pg_waiter = asyncio.create_task(
+            queue.acquire("privacy-gateway", "task-next", "llm", "/api/chat")
+        )
+        iz_waiter = asyncio.create_task(
+            queue.acquire("iz-scribe", "recording-next", "stt", "/v1/audio/transcriptions")
+        )
+        await asyncio.sleep(0)
+        await queue.release(current)
+        await asyncio.sleep(0)
+
+        assert iz_waiter.done()
+        assert not pg_waiter.done()
+        iz_ticket = await iz_waiter
+        await queue.release(iz_ticket)
+        pg_ticket = await pg_waiter
+        await queue.release(pg_ticket)
         queue.journal._db.close()
         module.journal._db.close()
 

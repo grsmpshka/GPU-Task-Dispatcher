@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${GPU_DEVICE_UUID:-}" ]; then
+    echo "GPU_DEVICE_UUID is required" >&2
+    exit 1
+fi
+
+gpu_index=$(
+    nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits |
+        awk -F, -v wanted="$GPU_DEVICE_UUID" '
+            {
+                gpu_idx=$1
+                uuid=$2
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", gpu_idx)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", uuid)
+                if (uuid == wanted) {
+                    print gpu_idx
+                    exit
+                }
+            }
+        '
+)
+
+if [ -z "$gpu_index" ]; then
+    echo "GPU UUID $GPU_DEVICE_UUID was not found" >&2
+    exit 1
+fi
+
+# This Ollama build does not reliably honour a UUID in CUDA_VISIBLE_DEVICES,
+# while a numeric CUDA index is respected. Resolve the replaceable UUID at
+# service start so the application configuration never depends on enumeration.
+export CUDA_VISIBLE_DEVICES="$gpu_index"
+export GGML_CUDA_VISIBLE_DEVICES="$gpu_index"
+exec "$@"
