@@ -23,6 +23,24 @@ def load_dispatcher(tmp_path: Path):
     return module
 
 
+def test_default_payload_limit_preserves_image_batches():
+    previous = os.environ.pop("GPU_JOB_PAYLOAD_MAX_BYTES", None)
+    try:
+        with TemporaryDirectory(dir=ROOT) as directory:
+            module = load_dispatcher(Path(directory))
+            assert module.JOB_PAYLOAD_MAX_BYTES == 16 * 1024 * 1024
+
+            payload = b"x" * (512 * 1024 + 1)
+            packed, truncated = module.Journal._pack_payload(payload)
+            assert truncated == 0
+            assert module.Journal._unpack_payload(packed) == payload.decode()
+
+            module.journal._db.close()
+    finally:
+        if previous is not None:
+            os.environ["GPU_JOB_PAYLOAD_MAX_BYTES"] = previous
+
+
 def test_queue_exposes_only_business_source_id():
     async def scenario(tmp_path: Path):
         module = load_dispatcher(tmp_path)
@@ -690,9 +708,6 @@ def test_monitor_uses_task_id_label():
     assert "Приложенное изображение" in detail_html
     assert "extractAttachedImages" in detail_html
     assert "imageType" in detail_html
-    assert "formatRequest" in detail_html
-    assert "redactImageFragments" in detail_html
-    assert "Данные изображения" in detail_html
     assert "html, body { max-width:100%; overflow-x:hidden }" in detail_html
     assert "Ответ ещё не получен." in detail_html
     assert "до включения журнала расшифровок" in detail_html

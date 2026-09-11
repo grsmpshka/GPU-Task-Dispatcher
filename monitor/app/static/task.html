@@ -118,58 +118,6 @@ function pretty(raw) {
   return raw;
 }
 
-function imagePlaceholder(type, byteLength, complete=true) {
-  const size = byteLength == null ? '' : ` · ${(byteLength / 1024).toFixed(1)} КБ`;
-  return complete
-    ? `[Приложенное изображение ${type}${size} — показано выше]`
-    : `[Данные изображения ${type}${size} скрыты из текста запроса]`;
-}
-
-function imageSignature(value) {
-  const compact = value.replace(/\s/g,'');
-  if (compact.startsWith('/9j/')) return 'JPEG';
-  if (compact.startsWith('iVBORw0KGgo')) return 'PNG';
-  if (compact.startsWith('R0lGOD')) return 'GIF';
-  if (compact.startsWith('UklGR')) return 'WEBP';
-  return null;
-}
-
-function sanitizeRequestValue(value) {
-  if (typeof value === 'string') {
-    const image = decodeImage(value);
-    if (image) return imagePlaceholder(image.extension,image.bytes.length);
-    const dataUrl = value.match(/^data:image\/([a-z0-9.+-]+);base64,/i);
-    const signature = imageSignature(value);
-    if (dataUrl || (signature && value.length >= 256)) {
-      return imagePlaceholder((dataUrl?.[1] || signature).toUpperCase(),Math.floor(value.replace(/\s/g,'').length * 3 / 4),false);
-    }
-    return value;
-  }
-  if (Array.isArray(value)) return value.map(sanitizeRequestValue);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key,item]) => [key,sanitizeRequestValue(item)]));
-  }
-  return value;
-}
-
-function redactImageFragments(raw) {
-  if (typeof raw !== 'string') return raw;
-  const imageData = /(?:data:image\/[a-z0-9.+-]+;base64,)?(?:\/9j\/|iVBORw0KGgo|R0lGOD|UklGR)[A-Za-z0-9+/\r\n]{252,}={0,2}/gi;
-  return raw.replace(imageData, value => {
-    const dataUrl = value.match(/^data:image\/([a-z0-9.+-]+);base64,/i);
-    const encoded = dataUrl ? value.slice(dataUrl[0].length) : value;
-    const type = (dataUrl?.[1] || imageSignature(encoded) || 'IMAGE').toUpperCase();
-    return imagePlaceholder(type,Math.floor(encoded.replace(/\s/g,'').length * 3 / 4),false);
-  });
-}
-
-function formatRequest(raw) {
-  if (raw == null || raw === '') return '';
-  if (typeof raw !== 'string') return JSON.stringify(sanitizeRequestValue(raw),null,2);
-  try { return JSON.stringify(sanitizeRequestValue(JSON.parse(raw)),null,2); } catch (_) {}
-  return pretty(redactImageFragments(raw));
-}
-
 function extractAnswer(raw) {
   try {
     const value = JSON.parse(raw);
@@ -318,7 +266,7 @@ async function load() {
     if (data.request_truncated) $('request-truncated').style.display='block';
     if (data.response_truncated) $('response-truncated').style.display='block';
     $('request').classList.remove('loading');
-    $('request').textContent = data.request_payload == null ? missingPayload('request',data) : (formatRequest(data.request_payload) || 'Запрос не содержит тела.');
+    $('request').textContent = data.request_payload == null ? missingPayload('request',data) : (pretty(data.request_payload) || 'Запрос не содержит тела.');
     renderAttachedImages(data.request_payload);
     responseFull = data.response_payload == null ? missingPayload('response',data) : (pretty(data.response_payload) || 'Ответ не содержит тела.');
     responseAnswer = data.response_payload == null ? null : extractAnswer(data.response_payload);
