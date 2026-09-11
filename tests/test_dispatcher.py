@@ -690,6 +690,10 @@ def test_monitor_uses_task_id_label():
     assert "Приложенное изображение" in detail_html
     assert "extractAttachedImages" in detail_html
     assert "imageType" in detail_html
+    assert "formatRequest" in detail_html
+    assert "redactImageFragments" in detail_html
+    assert "Данные изображения" in detail_html
+    assert "html, body { max-width:100%; overflow-x:hidden }" in detail_html
     assert "Ответ ещё не получен." in detail_html
     assert "до включения журнала расшифровок" in detail_html
     assert "/api/gpu-queue/${encodeURIComponent(jobId)}" in detail_html
