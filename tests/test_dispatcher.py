@@ -286,6 +286,111 @@ def test_business_cancel_endpoint_requires_service_specific_token():
         asyncio.run(scenario(Path(directory)))
 
 
+def test_compute_requests_require_task_identity_but_metadata_routes_do_not():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        transport = httpx.ASGITransport(app=module.app)
+        payload = {"model": "qwen3.6:27b", "messages": [{"role": "user", "content": "test"}]}
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            missing = await client.post("/api/chat", json=payload)
+            invalid = await client.post(
+                "/api/chat",
+                headers={"X-GPU-Service": "bad service", "X-GPU-Source-ID": "bad/id"},
+                json=payload,
+            )
+            missing_stt_id = await client.post(
+                "/v1/audio/transcriptions",
+                headers={"X-GPU-Service": "iz-scribe"},
+                content=b"not-a-multipart-request",
+            )
+
+        assert missing.status_code == 400
+        assert missing.json()["code"] == "gpu_task_parameters_invalid"
+        assert missing.json()["missing"] == ["X-GPU-Service", "X-GPU-Source-ID"]
+        assert invalid.status_code == 400
+        assert invalid.json()["invalid"] == ["X-GPU-Service", "X-GPU-Source-ID"]
+        assert missing_stt_id.status_code == 400
+        assert missing_stt_id.json()["missing"] == ["X-GPU-Source-ID"]
+        assert module.gpu_task_route("llm", "GET", "/api/tags") is False
+        assert module.gpu_task_route("llm", "POST", "/api/show") is False
+        assert module.gpu_task_route("llm", "GET", "/api/ps") is False
+        assert module.gpu_task_route("llm", "GET", "/api/version") is False
+        assert module.journal.recent_count() == 0
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_compute_task_payload_validation_is_explicit_and_num_ctx_is_optional():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        transport = httpx.ASGITransport(app=module.app)
+        headers = {"X-GPU-Service": "iz-scribe", "X-GPU-Source-ID": "meeting-42"}
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            malformed = await client.post(
+                "/api/chat", headers={**headers, "Content-Type": "application/json"}, content=b"{"
+            )
+            missing_model = await client.post(
+                "/api/chat", headers=headers, json={"messages": [{"role": "user", "content": "test"}]}
+            )
+            missing_messages = await client.post(
+                "/api/chat", headers=headers, json={"model": "qwen3.6:27b"}
+            )
+            invalid_num_ctx = await client.post(
+                "/api/chat",
+                headers=headers,
+                json={
+                    "model": "qwen3.6:27b",
+                    "messages": [{"role": "user", "content": "test"}],
+                    "options": {"num_ctx": "invalid"},
+                },
+            )
+            fractional_num_ctx = await client.post(
+                "/api/chat",
+                headers=headers,
+                json={
+                    "model": "qwen3.6:27b",
+                    "messages": [{"role": "user", "content": "test"}],
+                    "options": {"num_ctx": 16384.5},
+                },
+            )
+            invalid_stt = await client.post(
+                "/v1/audio/transcriptions",
+                headers=headers,
+                content=b"not-a-multipart-request",
+            )
+
+        assert malformed.status_code == 400
+        assert malformed.json() == {
+            "detail": "GPU task request body is missing required fields or is invalid",
+            "code": "gpu_task_payload_invalid",
+            "invalid": ["body"],
+            "retryable": False,
+        }
+        assert missing_model.status_code == 400
+        assert missing_model.json()["invalid"] == ["model"]
+        assert missing_messages.status_code == 400
+        assert missing_messages.json()["invalid"] == ["messages"]
+        assert invalid_num_ctx.status_code == 400
+        assert invalid_num_ctx.json()["invalid"] == ["options.num_ctx"]
+        assert fractional_num_ctx.status_code == 400
+        assert fractional_num_ctx.json()["invalid"] == ["options.num_ctx"]
+        assert invalid_stt.status_code == 400
+        assert invalid_stt.json()["invalid"] == ["Content-Type"]
+        assert module.llm_payload_problems(
+            json.dumps({"model": "qwen3.6:27b", "messages": [{"role": "user", "content": "test"}]}).encode(),
+            "/api/chat",
+        ) == []
+        assert module.journal.recent_count() == 0
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
 def test_scheduler_alternates_services_when_both_are_waiting():
     async def scenario(tmp_path: Path):
         module = load_dispatcher(tmp_path)

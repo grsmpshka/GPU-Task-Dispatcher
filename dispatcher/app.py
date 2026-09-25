@@ -65,6 +65,8 @@ HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 }
+LLM_TASK_ROUTES = {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings"}
+STT_TASK_ROUTES = {"/v1/audio/transcriptions", "/v1/audio/translations"}
 
 
 @dataclass(frozen=True)
@@ -418,6 +420,60 @@ def llm_request_metadata(payload: bytes | None) -> tuple[str, int | None]:
     except (TypeError, ValueError):
         num_ctx = None
     return model, num_ctx if num_ctx is None or num_ctx > 0 else None
+
+
+def gpu_task_route(kind: str, method: str, path: str) -> bool:
+    if method.upper() != "POST":
+        return False
+    return path in (LLM_TASK_ROUTES if kind == "llm" else STT_TASK_ROUTES)
+
+
+def task_identity_problems(request: Request) -> tuple[list[str], list[str]]:
+    missing: list[str] = []
+    invalid: list[str] = []
+    service = request.headers.get("x-gpu-service", "").strip()
+    external_source_id = request.headers.get("x-gpu-source-id", "").strip()
+    if not service:
+        missing.append("X-GPU-Service")
+    elif len(service) > 80 or not all(char.isalnum() or char in "-_." for char in service):
+        invalid.append("X-GPU-Service")
+    if not external_source_id:
+        missing.append("X-GPU-Source-ID")
+    elif len(external_source_id) > 160 or not all(
+        char.isalnum() or char in "-_:." for char in external_source_id
+    ):
+        invalid.append("X-GPU-Source-ID")
+    return missing, invalid
+
+
+def llm_payload_problems(payload: bytes | None, route: str) -> list[str]:
+    if not payload:
+        return ["body"]
+    try:
+        body = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ["body"]
+    if not isinstance(body, dict):
+        return ["body"]
+    invalid: list[str] = []
+    model = body.get("model")
+    if not isinstance(model, str) or not model.strip():
+        invalid.append("model")
+    if route == "/api/chat":
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            invalid.append("messages")
+    elif route == "/api/generate":
+        if not isinstance(body.get("prompt"), str):
+            invalid.append("prompt")
+    options = body.get("options")
+    if options is not None and not isinstance(options, dict):
+        invalid.append("options")
+    elif isinstance(options, dict) and "num_ctx" in options:
+        raw_num_ctx = options.get("num_ctx")
+        if isinstance(raw_num_ctx, bool) or not isinstance(raw_num_ctx, int) or raw_num_ctx <= 0:
+            invalid.append("options.num_ctx")
+    return invalid
 
 
 @dataclass
@@ -981,6 +1037,21 @@ def final_request(request: Request) -> bool:
 
 
 async def proxy(request: Request, kind: str) -> Response:
+    is_task = gpu_task_route(kind, request.method, request.url.path)
+    if is_task:
+        missing, invalid = task_identity_problems(request)
+        if missing or invalid:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": "Required GPU task headers are missing or invalid",
+                    "code": "gpu_task_parameters_invalid",
+                    "missing": missing,
+                    "invalid": invalid,
+                    "required_headers": ["X-GPU-Service", "X-GPU-Source-ID"],
+                    "retryable": False,
+                },
+            )
     service = service_name(request)
     external_source_id = source_id(request)
     if external_source_id and journal.is_task_cancelled(service, external_source_id):
@@ -998,6 +1069,30 @@ async def proxy(request: Request, kind: str) -> Response:
     # requests contain large binary audio, so they deliberately remain streamed
     # and are never copied into the journal.
     request_payload = await request.body() if kind == "llm" else None
+    if is_task and kind == "llm":
+        invalid = llm_payload_problems(request_payload, request.url.path)
+        if invalid:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": "GPU task request body is missing required fields or is invalid",
+                    "code": "gpu_task_payload_invalid",
+                    "invalid": invalid,
+                    "retryable": False,
+                },
+            )
+    if is_task and kind == "stt":
+        content_type = request.headers.get("content-type", "")
+        if not content_type.lower().startswith("multipart/form-data;") or "boundary=" not in content_type.lower():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": "Whisper task must use multipart/form-data with a boundary",
+                    "code": "gpu_task_payload_invalid",
+                    "invalid": ["Content-Type"],
+                    "retryable": False,
+                },
+            )
     try:
         ticket = await queue.acquire(
             service,
