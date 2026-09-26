@@ -87,7 +87,7 @@ code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all;
           <div class="queue-filters">
             <input id="filter-source" placeholder="ID задачи" oninput="scheduleQueueFilter()">
             <input id="filter-service" placeholder="Сервис" oninput="scheduleQueueFilter()">
-            <select id="filter-kind" onchange="applyQueueFilters()"><option value="">Все нагрузки</option><option value="llm">Qwen</option><option value="stt">Whisper</option></select>
+            <select id="filter-kind" onchange="applyQueueFilters()"><option value="">Все нагрузки</option><option value="llm">Qwen</option><option value="stt">Whisper</option><option value="reranker">Reranker</option></select>
             <select id="filter-status" onchange="applyQueueFilters()"><option value="">Все статусы</option><option value="running">Выполняется</option><option value="cancellation_pending">Останавливается</option><option value="queued">В очереди</option><option value="completed">Готово</option><option value="failed">Ошибка</option><option value="cancelled">Остановлено</option></select>
             <button class="secondary-btn" onclick="resetQueueFilters()">Сбросить</button>
           </div>
@@ -116,7 +116,7 @@ code.task-id { white-space:normal; overflow-wrap:anywhere; word-break:break-all;
   </div>
 
   <div class="grid3">
-    <section class="card"><h2>Процессы на GPU (Ollama / Whisper)</h2><div id="gpu-procs"></div></section>
+    <section class="card"><h2>Процессы на GPU (Ollama / Whisper / Reranker)</h2><div id="gpu-procs"></div></section>
     <section class="card"><h2>Загруженные модели Ollama</h2><div id="loaded"></div></section>
     <section class="card"><h2>Все модели Ollama</h2><div id="models"></div></section>
   </div>
@@ -138,7 +138,7 @@ function rows(el, items, fn){
 }
 const palette = ['#67e8a5','#67b8e8','#e8a567','#c67ee8','#e86767'];
 const serviceNames = {'iz-scribe':'IZ.Scribe','privacy-gateway':'Privacy Gateway','unregistered':'Неизвестный сервис'};
-const kindNames = {llm:'Qwen',stt:'Whisper'};
+const kindNames = {llm:'Qwen',stt:'Whisper',reranker:'Reranker'};
 const statusNames = {running:'Выполняется',cancellation_pending:'Останавливается',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
 const serviceLabel = s => serviceNames[s] || s;
 const kindLabel = k => kindNames[k] || k;

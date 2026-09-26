@@ -5,6 +5,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import math
 import os
 import secrets
 import sqlite3
@@ -28,6 +29,7 @@ logger = logging.getLogger("gpu-dispatcher")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://127.0.0.1:8000").rstrip("/")
+RERANKER_URL = os.getenv("RERANKER_URL", "http://127.0.0.1:8010").rstrip("/")
 DISPATCHER_TOKEN = os.getenv("GPU_DISPATCHER_TOKEN", "")
 
 
@@ -51,6 +53,9 @@ DATA_PATH = Path(os.getenv("GPU_DISPATCHER_DATA", "/data/dispatcher.db"))
 MAX_BATCH_TASKS = max(1, int(os.getenv("GPU_MAX_BATCH_TASKS", "12")))
 MAX_BATCH_SECONDS = max(1, int(os.getenv("GPU_MAX_BATCH_SECONDS", "300")))
 REQUEST_TIMEOUT = max(30, int(os.getenv("GPU_REQUEST_TIMEOUT_SECONDS", "10800")))
+RERANKER_TIMEOUT = min(
+    30.0, max(1.0, float(os.getenv("GPU_RERANKER_TIMEOUT_SECONDS", "30")))
+)
 OLLAMA_RELEASE_DELAY = max(0.0, float(os.getenv("GPU_OLLAMA_RELEASE_DELAY_SECONDS", "4")))
 JOB_HISTORY_LIMIT = max(1000, int(os.getenv("GPU_JOB_HISTORY_LIMIT", "100000")))
 JOB_PAYLOAD_MAX_BYTES = max(1024, int(os.getenv("GPU_JOB_PAYLOAD_MAX_BYTES", "16777216")))
@@ -67,6 +72,8 @@ HOP_HEADERS = {
 }
 LLM_TASK_ROUTES = {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings"}
 STT_TASK_ROUTES = {"/v1/audio/transcriptions", "/v1/audio/translations"}
+RERANKER_TASK_ROUTES = {"/rerank", "/v1/rerank"}
+RERANKER_MODEL = "dengcao/Qwen3-Reranker-0.6B:F16"
 
 
 @dataclass(frozen=True)
@@ -77,12 +84,17 @@ class GpuWorkerConfig:
     whisper_url: str
     max_context_tokens: int = 0
     models: tuple[str, ...] = ()
+    reranker_url: str = ""
 
 
 def load_worker_configs() -> list[GpuWorkerConfig]:
     raw = os.getenv("GPU_WORKERS_JSON", "").strip()
     if not raw:
-        return [GpuWorkerConfig("gpu-1", "GPU 1", OLLAMA_URL, WHISPER_URL)]
+        return [
+            GpuWorkerConfig(
+                "gpu-1", "GPU 1", OLLAMA_URL, WHISPER_URL, reranker_url=RERANKER_URL
+            )
+        ]
     try:
         values = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -101,10 +113,15 @@ def load_worker_configs() -> list[GpuWorkerConfig]:
             raise RuntimeError(f"GPU worker id {worker_id!r} contains unsupported characters")
         ollama_url = str(value.get("ollama_url", "")).strip().rstrip("/")
         whisper_url = str(value.get("whisper_url", "")).strip().rstrip("/")
+        reranker_url = str(
+            value.get("reranker_url") or f"http://127.0.0.1:{8009 + index}"
+        ).strip().rstrip("/")
         if not ollama_url.startswith(("http://", "https://")):
             raise RuntimeError(f"GPU worker {worker_id!r} has an invalid ollama_url")
         if not whisper_url.startswith(("http://", "https://")):
             raise RuntimeError(f"GPU worker {worker_id!r} has an invalid whisper_url")
+        if not reranker_url.startswith(("http://", "https://")):
+            raise RuntimeError(f"GPU worker {worker_id!r} has an invalid reranker_url")
         label = str(value.get("label") or worker_id).strip()[:80]
         max_context_tokens = max(
             0, int(value.get("max_context_tokens") or DEFAULT_MAX_CONTEXT_TOKENS)
@@ -115,7 +132,13 @@ def load_worker_configs() -> list[GpuWorkerConfig]:
         models = tuple(str(model).strip() for model in configured_models if str(model).strip())
         workers.append(
             GpuWorkerConfig(
-                worker_id, label, ollama_url, whisper_url, max_context_tokens, models
+                worker_id,
+                label,
+                ollama_url,
+                whisper_url,
+                max_context_tokens,
+                models,
+                reranker_url,
             )
         )
         seen.add(worker_id)
@@ -425,10 +448,17 @@ def llm_request_metadata(payload: bytes | None) -> tuple[str, int | None]:
 def gpu_task_route(kind: str, method: str, path: str) -> bool:
     if method.upper() != "POST":
         return False
-    return path in (LLM_TASK_ROUTES if kind == "llm" else STT_TASK_ROUTES)
+    routes = {
+        "llm": LLM_TASK_ROUTES,
+        "stt": STT_TASK_ROUTES,
+        "reranker": RERANKER_TASK_ROUTES,
+    }
+    return path in routes.get(kind, set())
 
 
-def task_identity_problems(request: Request) -> tuple[list[str], list[str]]:
+def task_identity_problems(
+    request: Request, *, require_source_id: bool = True
+) -> tuple[list[str], list[str]]:
     missing: list[str] = []
     invalid: list[str] = []
     service = request.headers.get("x-gpu-service", "").strip()
@@ -437,10 +467,11 @@ def task_identity_problems(request: Request) -> tuple[list[str], list[str]]:
         missing.append("X-GPU-Service")
     elif len(service) > 80 or not all(char.isalnum() or char in "-_." for char in service):
         invalid.append("X-GPU-Service")
-    if not external_source_id:
+    if not external_source_id and require_source_id:
         missing.append("X-GPU-Source-ID")
-    elif len(external_source_id) > 160 or not all(
-        char.isalnum() or char in "-_:." for char in external_source_id
+    elif external_source_id and (
+        len(external_source_id) > 160
+        or not all(char.isalnum() or char in "-_:." for char in external_source_id)
     ):
         invalid.append("X-GPU-Source-ID")
     return missing, invalid
@@ -474,6 +505,72 @@ def llm_payload_problems(payload: bytes | None, route: str) -> list[str]:
         if isinstance(raw_num_ctx, bool) or not isinstance(raw_num_ctx, int) or raw_num_ctx <= 0:
             invalid.append("options.num_ctx")
     return invalid
+
+
+def reranker_payload_problems(payload: bytes | None) -> list[str]:
+    if not payload:
+        return ["body"]
+    try:
+        body = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ["body"]
+    if not isinstance(body, dict):
+        return ["body"]
+    invalid: list[str] = []
+    if body.get("model") != RERANKER_MODEL:
+        invalid.append("model")
+    query = body.get("query")
+    if not isinstance(query, str) or not query.strip():
+        invalid.append("query")
+    documents = body.get("documents")
+    if (
+        not isinstance(documents, list)
+        or not documents
+        or any(not isinstance(document, str) or not document.strip() for document in documents)
+    ):
+        invalid.append("documents")
+    top_n = body.get("top_n")
+    if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n <= 0:
+        invalid.append("top_n")
+    return invalid
+
+
+def normalized_reranker_response(
+    payload: bytes, *, document_count: int, top_n: int
+) -> bytes:
+    try:
+        body = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Reranker returned invalid JSON") from exc
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list):
+        raise RuntimeError("Reranker response does not contain results")
+    normalized: list[dict[str, int | float]] = []
+    seen: set[int] = set()
+    for item in results:
+        if not isinstance(item, dict):
+            raise RuntimeError("Reranker returned an invalid result item")
+        index = item.get("index")
+        score = item.get("relevance_score")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= document_count
+            or index in seen
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+        ):
+            raise RuntimeError("Reranker returned an invalid index or relevance score")
+        seen.add(index)
+        normalized.append({"index": index, "relevance_score": float(score)})
+    normalized.sort(key=lambda item: item["relevance_score"], reverse=True)
+    return json.dumps(
+        {"results": normalized[: min(top_n, document_count)]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 @dataclass
@@ -564,7 +661,11 @@ class FairGpuQueue:
     ) -> Ticket:
         if source_id and self.journal.is_task_cancelled(service, source_id):
             raise TaskAlreadyCancelled(f"Task {service}/{source_id} was cancelled")
-        model, num_ctx = llm_request_metadata(request_payload) if kind == "llm" else ("", None)
+        model, num_ctx = (
+            llm_request_metadata(request_payload)
+            if kind in {"llm", "reranker"}
+            else ("", None)
+        )
         ticket = Ticket(uuid.uuid4().hex, service, source_id, kind, route)
         ticket.owner = asyncio.current_task()
         ticket.final_request = final_request
@@ -630,6 +731,8 @@ class FairGpuQueue:
 
     @staticmethod
     def _worker_can_run(config: GpuWorkerConfig, ticket: Ticket) -> bool:
+        if ticket.kind == "reranker":
+            return bool(config.reranker_url)
         if ticket.kind != "llm":
             return True
         if config.models and ticket.model and ticket.model not in config.models:
@@ -1009,13 +1112,35 @@ async def unload_whisper(client: httpx.AsyncClient, whisper_url: str) -> None:
     response.raise_for_status()
 
 
+async def wait_for_reranker_sleep(
+    client: httpx.AsyncClient, reranker_url: str, *, attempts: int = 120
+) -> None:
+    for _ in range(attempts):
+        try:
+            response = await client.get(f"{reranker_url}/props")
+        except httpx.ConnectError:
+            # A stopped backend cannot hold GPU memory.
+            return
+        if response.is_success and response.json().get("is_sleeping") is True:
+            return
+        await asyncio.sleep(0.5)
+    raise RuntimeError("Reranker model did not release GPU memory within 60 seconds")
+
+
 async def prepare_gpu(
     client: httpx.AsyncClient, worker: GpuWorkerConfig, kind: str
 ) -> None:
     if kind == "stt":
         await unload_ollama(client, worker.ollama_url)
-    else:
+        await wait_for_reranker_sleep(client, worker.reranker_url)
+    elif kind == "llm":
         await unload_whisper(client, worker.whisper_url)
+        await wait_for_reranker_sleep(client, worker.reranker_url)
+    elif kind == "reranker":
+        await unload_ollama(client, worker.ollama_url)
+        await unload_whisper(client, worker.whisper_url)
+    else:
+        raise RuntimeError(f"Unsupported GPU workload kind: {kind}")
 
 
 def service_name(request: Request) -> str:
@@ -1039,8 +1164,14 @@ def final_request(request: Request) -> bool:
 async def proxy(request: Request, kind: str) -> Response:
     is_task = gpu_task_route(kind, request.method, request.url.path)
     if is_task:
-        missing, invalid = task_identity_problems(request)
+        require_source_id = kind != "reranker"
+        missing, invalid = task_identity_problems(
+            request, require_source_id=require_source_id
+        )
         if missing or invalid:
+            required_headers = ["X-GPU-Service"]
+            if require_source_id:
+                required_headers.append("X-GPU-Source-ID")
             return JSONResponse(
                 status_code=400,
                 content={
@@ -1048,7 +1179,7 @@ async def proxy(request: Request, kind: str) -> Response:
                     "code": "gpu_task_parameters_invalid",
                     "missing": missing,
                     "invalid": invalid,
-                    "required_headers": ["X-GPU-Service", "X-GPU-Source-ID"],
+                    "required_headers": required_headers,
                     "retryable": False,
                 },
             )
@@ -1068,7 +1199,7 @@ async def proxy(request: Request, kind: str) -> Response:
     # LLM payloads are textual JSON and useful for later diagnostics. Whisper
     # requests contain large binary audio, so they deliberately remain streamed
     # and are never copied into the journal.
-    request_payload = await request.body() if kind == "llm" else None
+    request_payload = await request.body() if kind in {"llm", "reranker"} else None
     if is_task and kind == "llm":
         invalid = llm_payload_problems(request_payload, request.url.path)
         if invalid:
@@ -1081,6 +1212,21 @@ async def proxy(request: Request, kind: str) -> Response:
                     "retryable": False,
                 },
             )
+    reranker_body: dict[str, object] | None = None
+    if is_task and kind == "reranker":
+        invalid = reranker_payload_problems(request_payload)
+        if invalid:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": "Reranker request body is missing required fields or is invalid",
+                    "code": "gpu_task_payload_invalid",
+                    "invalid": invalid,
+                    "supported_models": [RERANKER_MODEL],
+                    "retryable": False,
+                },
+            )
+        reranker_body = json.loads(request_payload or b"{}")
     if is_task and kind == "stt":
         content_type = request.headers.get("content-type", "")
         if not content_type.lower().startswith("multipart/form-data;") or "boundary=" not in content_type.lower():
@@ -1129,8 +1275,15 @@ async def proxy(request: Request, kind: str) -> Response:
     status_code: int | None = None
     try:
         worker = queue.worker(ticket.worker_id)
-        upstream_base = worker.ollama_url if kind == "llm" else worker.whisper_url
-        timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=15, write=REQUEST_TIMEOUT, pool=15)
+        upstream_base = {
+            "llm": worker.ollama_url,
+            "stt": worker.whisper_url,
+            "reranker": worker.reranker_url,
+        }[kind]
+        request_timeout = RERANKER_TIMEOUT if kind == "reranker" else REQUEST_TIMEOUT
+        timeout = httpx.Timeout(
+            request_timeout, connect=min(15, request_timeout), write=request_timeout, pool=15
+        )
         async with httpx.AsyncClient(timeout=timeout) as client:
             await prepare_gpu(client, worker, kind)
             headers = {
@@ -1138,13 +1291,18 @@ async def proxy(request: Request, kind: str) -> Response:
                 if key.lower() not in HOP_HEADERS
             }
             headers["X-GPU-Job-ID"] = ticket.id
-            upstream = await client.request(
-                request.method,
-                upstream_base + request.url.path,
-                params=request.query_params,
-                headers=headers,
-                content=request_payload if kind == "llm" else request.stream(),
-            )
+            async with asyncio.timeout(request_timeout):
+                upstream = await client.request(
+                    request.method,
+                    upstream_base + request.url.path,
+                    params=request.query_params,
+                    headers=headers,
+                    content=(
+                        request_payload
+                        if kind in {"llm", "reranker"}
+                        else request.stream()
+                    ),
+                )
             status_code = upstream.status_code
             response_headers = {
                 key: value for key, value in upstream.headers.items()
@@ -1176,17 +1334,33 @@ async def proxy(request: Request, kind: str) -> Response:
                         "retryable": False,
                     },
                 )
+            response_payload = upstream.content
+            response_content_type = upstream.headers.get("content-type", "")
+            if kind == "reranker" and upstream.is_success:
+                assert reranker_body is not None
+                documents = reranker_body["documents"]
+                top_n = reranker_body["top_n"]
+                assert isinstance(documents, list) and isinstance(top_n, int)
+                response_payload = normalized_reranker_response(
+                    upstream.content,
+                    document_count=len(documents),
+                    top_n=top_n,
+                )
+                response_content_type = "application/json"
+                response_headers["content-type"] = "application/json"
             journal.finished(
                 ticket.id,
                 "completed" if upstream.status_code < 500 else "failed",
                 int((time.monotonic() - started) * 1000),
                 upstream.status_code,
-                response_content_type=upstream.headers.get("content-type", ""),
+                response_content_type=response_content_type,
                 # Whisper responses are textual JSON transcripts and are safe
                 # to journal even though the binary audio request is not.
-                response_payload=upstream.content,
+                response_payload=response_payload,
             )
-            return Response(upstream.content, status_code=upstream.status_code, headers=response_headers)
+            return Response(
+                response_payload, status_code=upstream.status_code, headers=response_headers
+            )
     except Exception as exc:
         logger.exception("GPU job %s failed", ticket.id)
         await queue.mark_worker_unhealthy(ticket.worker_id, str(exc))
@@ -1209,25 +1383,45 @@ async def proxy(request: Request, kind: str) -> Response:
                     "retryable": False,
                 },
             )
+        timed_out = kind == "reranker" and isinstance(
+            exc, (TimeoutError, httpx.TimeoutException)
+        )
+        response_status = 504 if timed_out else 503
+        error_code = "reranker_timeout" if timed_out else "gpu_task_failed"
         error_payload = json.dumps(
-            {"detail": "GPU task failed", "error": str(exc), "gpu_job_id": ticket.id},
+            {
+                "detail": "Reranker timed out" if timed_out else "GPU task failed",
+                "code": error_code,
+                "error": str(exc),
+                "gpu_job_id": ticket.id,
+            },
             ensure_ascii=False,
         ).encode("utf-8")
         journal.finished(
             ticket.id,
             "failed",
             int((time.monotonic() - started) * 1000),
-            status_code,
+            response_status,
             str(exc),
             response_content_type="application/json",
             response_payload=error_payload,
         )
         return JSONResponse(
-            status_code=503,
-            content={"detail": "GPU task failed", "gpu_job_id": ticket.id, "retryable": True},
+            status_code=response_status,
+            content={
+                "detail": "Reranker timed out" if timed_out else "GPU task failed",
+                "code": error_code,
+                "gpu_job_id": ticket.id,
+                "retryable": True,
+            },
             headers={"Retry-After": "5"},
         )
     finally:
+        if kind == "reranker" and status_code is None:
+            with contextlib.suppress(Exception):
+                worker = queue.worker(ticket.worker_id)
+                async with httpx.AsyncClient(timeout=65) as cleanup_client:
+                    await wait_for_reranker_sleep(cleanup_client, worker.reranker_url)
         await queue.release(ticket)
 
 
@@ -1239,11 +1433,15 @@ async def health() -> dict[str, object]:
     async with httpx.AsyncClient(timeout=5) as client:
         worker_health = []
         for worker in GPU_WORKERS:
-            ollama_ok = whisper_ok = False
+            ollama_ok = whisper_ok = reranker_ok = False
             with contextlib.suppress(Exception):
                 ollama_ok = (await client.get(f"{worker.ollama_url}/api/tags")).is_success
             with contextlib.suppress(Exception):
                 whisper_ok = (await client.get(f"{worker.whisper_url}/health")).is_success
+            with contextlib.suppress(Exception):
+                reranker_ok = (
+                    await client.get(f"{worker.reranker_url}/health")
+                ).is_success
             runtime = runtime_workers.get(worker.id, {})
             runtime_available = bool(runtime.get("available", True))
             worker_health.append({
@@ -1251,16 +1449,20 @@ async def health() -> dict[str, object]:
                 "label": worker.label,
                 "ollama": ollama_ok,
                 "whisper": whisper_ok,
+                "reranker": reranker_ok,
                 "runtime_available": runtime_available,
                 "cooldown_remaining_ms": runtime.get("cooldown_remaining_ms", 0),
                 "last_error": runtime.get("last_error", ""),
-                "available": ollama_ok and whisper_ok and runtime_available,
+                "available": (
+                    ollama_ok and whisper_ok and reranker_ok and runtime_available
+                ),
             })
     all_ok = all(item["available"] for item in worker_health)
     return {
         "status": "ok" if all_ok else "degraded",
         "ollama": all(item["ollama"] for item in worker_health),
         "whisper": all(item["whisper"] for item in worker_health),
+        "reranker": all(item["reranker"] for item in worker_health),
         "worker_health": worker_health,
         **queue.snapshot(),
     }
@@ -1373,6 +1575,12 @@ async def cancel_job(job_id: str, request: Request) -> JSONResponse:
         status_code=202 if result == "cancellation_pending" else 200,
         content={"status": result, "job_id": job_id},
     )
+
+
+@app.post("/rerank")
+@app.post("/v1/rerank")
+async def reranker_proxy(request: Request) -> Response:
+    return await proxy(request, "reranker")
 
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])

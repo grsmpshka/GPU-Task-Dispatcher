@@ -7,7 +7,7 @@ Privacy Gateway и будущие локальные приложения. Пр�
 ## Возможности
 
 - параллельное выполнение независимых задач на разных GPU без переполнения VRAM;
-- автоматическая выгрузка Whisper перед Qwen и Qwen перед Whisper;
+- автоматическое безопасное переключение Qwen, Whisper и Reranker;
 - ограниченное пакетирование однотипных LLM-запросов;
 - эксклюзивное выполнение всех GPU-этапов одной бизнес-задачи без чередования
   с задачами других сервисов и с закреплением за одним GPU;
@@ -24,11 +24,12 @@ Privacy Gateway и будущие локальные приложения. Пр�
 
 ## Порты
 
-- `11435` — совместимый прокси Ollama/Whisper и API очереди;
+- `11435` — совместимый прокси Ollama/Whisper/Reranker и API очереди;
 - `9999` — веб-панель.
 
 Внутренние worker-сервисы используют отдельные порты для каждого слота,
-например Ollama `11434`/`11436` и Whisper `8000`/`8001`. Клиентские сервисы
+например Ollama `11434`/`11436`, Whisper `8000`/`8001` и Reranker
+`8010`/`8011`. Клиентские сервисы
 по-прежнему обращаются только к брокеру на `11435`.
 
 ## Запуск
@@ -50,7 +51,7 @@ curl http://127.0.0.1:9999/
 
 ## Подключение сервиса
 
-Вместо прямого Ollama/Whisper используйте `http://HOST:11435` и передавайте:
+Вместо прямого Ollama/Whisper/Reranker используйте `http://HOST:11435` и передавайте:
 
 ```text
 X-GPU-Service: privacy-gateway
@@ -70,16 +71,16 @@ GPU-запрос задачи, он может добавить `X-GPU-Task-Fina
 ## Несколько GPU
 
 Слоты задаются переменной `GPU_WORKERS_JSON`. Каждый слот содержит логический
-ID, отображаемое имя и адреса независимых Ollama/Whisper:
+ID, отображаемое имя и адреса независимых Ollama/Whisper/Reranker:
 
 ```json
 [
-  {"id":"gpu-1","label":"Primary GPU","ollama_url":"http://127.0.0.1:11434","whisper_url":"http://127.0.0.1:8000"},
-  {"id":"gpu-2","label":"Secondary GPU","ollama_url":"http://127.0.0.1:11436","whisper_url":"http://127.0.0.1:8001"}
+  {"id":"gpu-1","label":"Primary GPU","ollama_url":"http://127.0.0.1:11434","whisper_url":"http://127.0.0.1:8000","reranker_url":"http://127.0.0.1:8010"},
+  {"id":"gpu-2","label":"Secondary GPU","ollama_url":"http://127.0.0.1:11436","whisper_url":"http://127.0.0.1:8001","reranker_url":"http://127.0.0.1:8011"}
 ]
 ```
 
-Брокер выполняет по одному запросу на каждом слоте. Все LLM/STT-запросы одной
+Брокер выполняет по одному запросу на каждом слоте. Все LLM/STT/Reranker-запросы одной
 бизнес-задачи остаются на исходном слоте до её завершения. Независимая задача
 может одновременно выполняться на другом GPU.
 
@@ -133,6 +134,26 @@ sudo systemctl mask ollama.service
 docker compose --profile gpu-workers up -d whisper-gpu-1 whisper-gpu-2
 ```
 
+Reranker запускается отдельным `llama.cpp` backend, потому что Ollama не
+предоставляет cross-encoder scores. Для него нужен актуально сконвертированный
+F16-GGUF с classifier head и reranker metadata; старые универсальные GGUF дают
+почти нулевые scores и неправильный порядок. Проверенный файл хранится в
+`/srv/apps/gpu-task-dispatcher/models` и сверяется по SHA-256 из `.env.example`.
+Backend автоматически выгружает модель из VRAM после простоя:
+
+```bash
+sudo install -d -m 755 /srv/apps/gpu-task-dispatcher/models
+sudo curl -fL -o /srv/apps/gpu-task-dispatcher/models/Qwen3-Reranker-0.6B-fixed-f16.gguf \
+  'https://huggingface.co/cicaba/Qwen3-Reranker-0.6B-GGUF-llamacpp-fixed/resolve/main/Qwen3-Reranker-0.6B-fixed-f16.gguf?download=true'
+echo '15e38d12462f56791bed44d97bad3880028d6fccebe99db0498c9e613f4aaf1f  /srv/apps/gpu-task-dispatcher/models/Qwen3-Reranker-0.6B-fixed-f16.gguf' \
+  | sha256sum -c -
+docker compose --profile gpu-workers up -d reranker-gpu-1 reranker-gpu-2
+```
+
+API сохраняет совместимое имя модели
+`dengcao/Qwen3-Reranker-0.6B:F16`; исправленный GGUF содержит те же F16-веса
+Qwen3-Reranker, но дополнен метаданными для настоящего rank pooling.
+
 При доступном образе Ollama вместо systemd можно запустить жёстко
 изолированные контейнеры `ollama-gpu-1` и `ollama-gpu-2` тем же профилем.
 
@@ -140,10 +161,39 @@ docker compose --profile gpu-workers up -d whisper-gpu-1 whisper-gpu-2
 
 - Ollama: `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`;
 - Whisper: `/v1/audio/transcriptions`;
+- Reranker: `POST /rerank` и `POST /v1/rerank`;
 - состояние: `/health`, `/queue`.
 - административное управление: `POST /queue/{internal_job_id}/cancel` с
   заголовком `X-GPU-Dispatcher-Token`;
 - отмена бизнес-задачи: `POST /queue/cancel`, контракт приведён ниже.
+
+## Reranker API
+
+`POST /rerank` и его алиас `POST /v1/rerank` принимают:
+
+```json
+{
+  "model": "dengcao/Qwen3-Reranker-0.6B:F16",
+  "query": "Как восстановить пароль?",
+  "documents": [
+    "Инструкция по восстановлению пароля",
+    "Правила оформления командировок"
+  ],
+  "top_n": 2
+}
+```
+
+Ответ содержит исходные индексы документов и числовые cross-encoder scores,
+отсортированные по убыванию:
+
+```json
+{"results":[{"index":0,"relevance_score":0.97},{"index":1,"relevance_score":0.04}]}
+```
+
+`X-GPU-Service` обязателен. `X-GPU-Source-ID` можно передать для привязки
+к бизнес-задаче, а `X-GPU-Task-Final: true` — для немедленного освобождения
+её слота. Все три заголовка передаются backend без изменения. Обработка
+reranker ограничена 30 секундами и учитывается общей очередью и журналом.
 
 ## Контракт отмены бизнес-задачи
 

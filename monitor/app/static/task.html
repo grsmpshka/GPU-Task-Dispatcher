@@ -94,7 +94,7 @@ pre { width:100%; min-width:0; max-width:100%; flex:1; margin:0; padding:16px; o
 const $ = id => document.getElementById(id);
 const statusNames = {running:'Выполняется',cancellation_pending:'Останавливается',queued:'В очереди',completed:'Готово',failed:'Ошибка',cancelled:'Остановлено'};
 const serviceNames = {'iz-scribe':'IZ.Scribe','privacy-gateway':'Privacy Gateway','unregistered':'Неизвестный сервис'};
-const kindNames = {llm:'Qwen',stt:'Whisper'};
+const kindNames = {llm:'Qwen',stt:'Whisper',reranker:'Reranker'};
 let job = null;
 let responseMode = 'full';
 let responseFull = '';

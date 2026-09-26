@@ -15,6 +15,7 @@ services:
       GPU_MAX_BATCH_TASKS: "${GPU_MAX_BATCH_TASKS:-12}"
       GPU_MAX_BATCH_SECONDS: "${GPU_MAX_BATCH_SECONDS:-300}"
       GPU_REQUEST_TIMEOUT_SECONDS: "${GPU_REQUEST_TIMEOUT_SECONDS:-10800}"
+      GPU_RERANKER_TIMEOUT_SECONDS: "${GPU_RERANKER_TIMEOUT_SECONDS:-30}"
       GPU_OLLAMA_RELEASE_DELAY_SECONDS: "${GPU_OLLAMA_RELEASE_DELAY_SECONDS:-4}"
       GPU_JOB_HISTORY_LIMIT: "${GPU_JOB_HISTORY_LIMIT:-100000}"
       GPU_JOB_PAYLOAD_MAX_BYTES: "${GPU_JOB_PAYLOAD_MAX_BYTES:-16777216}"
@@ -92,6 +93,96 @@ services:
       OLLAMA_NUM_PARALLEL: "1"
     volumes:
       - /srv/ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_SLOT_2_DEVICE}"]
+              capabilities: [gpu]
+
+  reranker-gpu-1:
+    profiles: ["gpu-workers"]
+    image: "${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp@sha256:1f4b9cf58982dd4d7cc497aea31b1a456ca9a3a1f94f527d317d3fdee0d60ab6}"
+    container_name: gpu-reranker-1
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --model
+      - "/models/${RERANKER_MODEL_FILE:-Qwen3-Reranker-0.6B-fixed-f16.gguf}"
+      - --alias
+      - "dengcao/Qwen3-Reranker-0.6B:F16"
+      - --host
+      - "127.0.0.1"
+      - --port
+      - "8010"
+      - --ctx-size
+      - "8192"
+      - --parallel
+      - "1"
+      - --batch-size
+      - "2048"
+      - --ubatch-size
+      - "2048"
+      - --n-gpu-layers
+      - "all"
+      - --flash-attn
+      - "on"
+      - --embedding
+      - --reranking
+      - --pooling
+      - "rank"
+      - --sleep-idle-seconds
+      - "1"
+      - --no-cache-prompt
+      - --no-webui
+    volumes:
+      - /srv/apps/gpu-task-dispatcher/models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_SLOT_1_DEVICE}"]
+              capabilities: [gpu]
+
+  reranker-gpu-2:
+    profiles: ["gpu-workers"]
+    image: "${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp@sha256:1f4b9cf58982dd4d7cc497aea31b1a456ca9a3a1f94f527d317d3fdee0d60ab6}"
+    container_name: gpu-reranker-2
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --model
+      - "/models/${RERANKER_MODEL_FILE:-Qwen3-Reranker-0.6B-fixed-f16.gguf}"
+      - --alias
+      - "dengcao/Qwen3-Reranker-0.6B:F16"
+      - --host
+      - "127.0.0.1"
+      - --port
+      - "8011"
+      - --ctx-size
+      - "8192"
+      - --parallel
+      - "1"
+      - --batch-size
+      - "2048"
+      - --ubatch-size
+      - "2048"
+      - --n-gpu-layers
+      - "all"
+      - --flash-attn
+      - "on"
+      - --embedding
+      - --reranking
+      - --pooling
+      - "rank"
+      - --sleep-idle-seconds
+      - "1"
+      - --no-cache-prompt
+      - --no-webui
+    volumes:
+      - /srv/apps/gpu-task-dispatcher/models:/models:ro
     deploy:
       resources:
         reservations:

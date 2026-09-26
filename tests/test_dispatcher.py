@@ -391,6 +391,126 @@ def test_compute_task_payload_validation_is_explicit_and_num_ctx_is_optional():
         asyncio.run(scenario(Path(directory)))
 
 
+def test_reranker_payload_and_response_contract():
+    with TemporaryDirectory(dir=ROOT) as directory:
+        module = load_dispatcher(Path(directory))
+        valid = {
+            "model": module.RERANKER_MODEL,
+            "query": "восстановление пароля",
+            "documents": ["инструкция по сбросу пароля", "график отпусков"],
+            "top_n": 1,
+        }
+        assert module.reranker_payload_problems(
+            json.dumps(valid, ensure_ascii=False).encode()
+        ) == []
+        assert module.reranker_payload_problems(
+            json.dumps({**valid, "model": "unsupported"}).encode()
+        ) == ["model"]
+        assert module.reranker_payload_problems(
+            json.dumps({**valid, "query": ""}).encode()
+        ) == ["query"]
+        assert module.reranker_payload_problems(
+            json.dumps({**valid, "documents": []}).encode()
+        ) == ["documents"]
+        assert module.reranker_payload_problems(
+            json.dumps({**valid, "top_n": 0}).encode()
+        ) == ["top_n"]
+
+        normalized = module.normalized_reranker_response(
+            json.dumps(
+                {
+                    "model": "backend-alias",
+                    "results": [
+                        {"index": 1, "relevance_score": 0.04},
+                        {"index": 0, "relevance_score": 0.97},
+                    ],
+                }
+            ).encode(),
+            document_count=2,
+            top_n=1,
+        )
+        assert json.loads(normalized) == {
+            "results": [{"index": 0, "relevance_score": 0.97}]
+        }
+        assert module.RERANKER_TIMEOUT <= 30
+        module.journal._db.close()
+
+
+def test_reranker_aliases_require_service_but_allow_missing_source_id():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        transport = httpx.ASGITransport(app=module.app)
+        payload = {
+            "model": module.RERANKER_MODEL,
+            "query": "query",
+            "documents": ["document"],
+            "top_n": 0,
+        }
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            missing_service = await client.post("/rerank", json=payload)
+            payload_error = await client.post(
+                "/v1/rerank",
+                headers={"X-GPU-Service": "ragflow"},
+                json=payload,
+            )
+
+        assert missing_service.status_code == 400
+        assert missing_service.json()["code"] == "gpu_task_parameters_invalid"
+        assert missing_service.json()["missing"] == ["X-GPU-Service"]
+        assert payload_error.status_code == 400
+        assert payload_error.json()["code"] == "gpu_task_payload_invalid"
+        assert payload_error.json()["invalid"] == ["top_n"]
+        assert module.gpu_task_route("reranker", "POST", "/rerank") is True
+        assert module.gpu_task_route("reranker", "POST", "/v1/rerank") is True
+        assert module.journal.recent_count() == 0
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_reranker_uses_only_workers_with_a_backend():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        workers = [
+            module.GpuWorkerConfig(
+                "gpu-1",
+                "GPU 1",
+                "http://ollama-1",
+                "http://whisper-1",
+                reranker_url="http://reranker-1",
+            ),
+            module.GpuWorkerConfig(
+                "gpu-2", "GPU 2", "http://ollama-2", "http://whisper-2"
+            ),
+        ]
+        queue = module.FairGpuQueue(
+            module.Journal(tmp_path / "reranker.db"),
+            task_idle_seconds=0,
+            workers=workers,
+        )
+        payload = json.dumps(
+            {
+                "model": module.RERANKER_MODEL,
+                "query": "query",
+                "documents": ["document"],
+                "top_n": 1,
+            }
+        ).encode()
+        ticket = await queue.acquire(
+            "ragflow", "", "reranker", "/rerank", request_payload=payload
+        )
+        assert ticket.worker_id == "gpu-1"
+        assert ticket.model == module.RERANKER_MODEL
+        assert queue.snapshot()["active_jobs"][0]["kind"] == "reranker"
+        await queue.release(ticket)
+        queue.journal._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
 def test_scheduler_alternates_services_when_both_are_waiting():
     async def scenario(tmp_path: Path):
         module = load_dispatcher(tmp_path)
