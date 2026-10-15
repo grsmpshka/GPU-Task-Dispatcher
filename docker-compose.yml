@@ -70,6 +70,8 @@ services:
       OLLAMA_MODELS: "/root/.ollama/models"
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
     volumes:
       - /srv/ollama:/root/.ollama
     deploy:
@@ -91,6 +93,8 @@ services:
       OLLAMA_MODELS: "/root/.ollama/models"
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
     volumes:
       - /srv/ollama:/root/.ollama
     deploy:
