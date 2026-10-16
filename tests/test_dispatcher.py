@@ -232,6 +232,129 @@ def test_num_ctx_is_preserved_and_checked_against_worker_capacity():
         asyncio.run(scenario(Path(directory)))
 
 
+def test_large_context_waits_for_all_gpus_and_blocks_new_work():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        workers = [
+            module.GpuWorkerConfig(
+                "gpu-1", "GPU 1", "http://ollama-1", "http://whisper-1",
+                100, ("qwen3.8:27b",),
+            ),
+            module.GpuWorkerConfig(
+                "gpu-2", "GPU 2", "http://ollama-2", "http://whisper-2",
+                120, ("qwen3.8:27b",),
+            ),
+        ]
+        queue = module.FairGpuQueue(
+            module.Journal(tmp_path / "large-context.db"),
+            task_idle_seconds=60,
+            workers=workers,
+            large_context_max_tokens=200,
+            large_context_worker_id="gpu-2",
+            large_context_models=("qwen3.8:27b",),
+        )
+        first = await queue.acquire(
+            "privacy-gateway", "document-1", "llm", "/api/chat",
+            request_payload=b'{"model":"qwen3.8:27b","options":{"num_ctx":100}}',
+        )
+        second = await queue.acquire(
+            "iz-scribe", "recording-1", "stt", "/v1/audio/transcriptions"
+        )
+        large_task = asyncio.create_task(queue.acquire(
+            "iz-config", "analysis-1", "llm", "/api/chat",
+            request_payload=b'{"model":"qwen3.8:27b","options":{"num_ctx":200}}',
+            final_request=True,
+        ))
+        await asyncio.sleep(0)
+        snapshot = queue.snapshot()
+        assert snapshot["pending"][0]["exclusive"] is True
+        assert not large_task.done()
+
+        await queue.release(first)
+        ordinary_task = asyncio.create_task(queue.acquire(
+            "iz-scribe", "recording-2", "stt", "/v1/audio/transcriptions"
+        ))
+        await asyncio.sleep(0)
+        assert not ordinary_task.done()
+        assert not large_task.done()
+
+        await queue.release(second)
+        large = await large_task
+        assert large.worker_id == "gpu-2"
+        assert large.exclusive is True
+        snapshot = queue.snapshot()
+        assert snapshot["exclusive_active"] is True
+        assert all(item["reserved_by_exclusive"] for item in snapshot["workers"])
+        assert not ordinary_task.done()
+
+        await queue.release(large)
+        ordinary = await ordinary_task
+        assert ordinary.exclusive is False
+        await queue.release(ordinary)
+        queue.journal._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+def test_large_context_is_model_scoped_capped_and_can_migrate_sticky_task():
+    async def scenario(tmp_path: Path):
+        module = load_dispatcher(tmp_path)
+        workers = [
+            module.GpuWorkerConfig(
+                "gpu-1", "GPU 1", "http://ollama-1", "http://whisper-1",
+                100, ("qwen3.8:27b",),
+            ),
+            module.GpuWorkerConfig(
+                "gpu-2", "GPU 2", "http://ollama-2", "http://whisper-2",
+                120, ("qwen3.8:27b",),
+            ),
+        ]
+        queue = module.FairGpuQueue(
+            module.Journal(tmp_path / "large-context-validation.db"),
+            task_idle_seconds=60,
+            workers=workers,
+            large_context_max_tokens=200,
+            large_context_worker_id="gpu-2",
+            large_context_models=("qwen3.8:27b",),
+        )
+        small = await queue.acquire(
+            "iz-config", "analysis-1", "llm", "/api/chat",
+            request_payload=b'{"model":"qwen3.8:27b","options":{"num_ctx":100}}',
+        )
+        assert small.worker_id == "gpu-1"
+        await queue.release(small)
+
+        large = await queue.acquire(
+            "iz-config", "analysis-1", "llm", "/api/chat",
+            request_payload=b'{"model":"qwen3.8:27b","options":{"num_ctx":200}}',
+            final_request=True,
+        )
+        assert large.worker_id == "gpu-2"
+        assert large.exclusive is True
+        await queue.release(large)
+
+        for payload in (
+            b'{"model":"qwen3.8:27b","options":{"num_ctx":201}}',
+            b'{"model":"other-model","options":{"num_ctx":150}}',
+        ):
+            try:
+                await queue.acquire(
+                    "iz-config", "unsupported", "llm", "/api/chat",
+                    request_payload=payload,
+                )
+                raise AssertionError("unsupported large context was accepted")
+            except module.UnschedulableRequest:
+                pass
+
+        queue.journal._db.close()
+        module.journal._db.close()
+
+    with TemporaryDirectory(dir=ROOT) as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
 def test_business_cancel_endpoint_requires_service_specific_token():
     async def scenario(tmp_path: Path):
         previous = os.environ.get("GPU_SERVICE_CANCEL_TOKENS_JSON")

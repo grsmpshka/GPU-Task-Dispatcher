@@ -66,6 +66,15 @@ WORKER_FAILURE_COOLDOWN = max(
 DEFAULT_MAX_CONTEXT_TOKENS = max(
     0, int(os.getenv("GPU_DEFAULT_MAX_CONTEXT_TOKENS", "0"))
 )
+LARGE_CONTEXT_MAX_TOKENS = max(
+    0, int(os.getenv("GPU_LARGE_CONTEXT_MAX_TOKENS", "0"))
+)
+LARGE_CONTEXT_WORKER_ID = os.getenv("GPU_LARGE_CONTEXT_WORKER_ID", "").strip()
+LARGE_CONTEXT_MODELS = tuple(
+    model.strip()
+    for model in os.getenv("GPU_LARGE_CONTEXT_MODELS", "").split(",")
+    if model.strip()
+)
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
@@ -588,6 +597,7 @@ class Ticket:
     worker_id: str | None = None
     model: str = ""
     num_ctx: int | None = None
+    exclusive: bool = False
     cancellation_requested: bool = False
 
     @property
@@ -622,6 +632,9 @@ class FairGpuQueue:
         task_idle_seconds: float = TASK_IDLE_SECONDS,
         worker_failure_cooldown: float = WORKER_FAILURE_COOLDOWN,
         workers: list[GpuWorkerConfig] | None = None,
+        large_context_max_tokens: int = LARGE_CONTEXT_MAX_TOKENS,
+        large_context_worker_id: str = LARGE_CONTEXT_WORKER_ID,
+        large_context_models: tuple[str, ...] = LARGE_CONTEXT_MODELS,
     ):
         self.journal = journal
         self.task_idle_seconds = max(0.0, task_idle_seconds)
@@ -636,6 +649,10 @@ class FairGpuQueue:
         }
         self._task_workers: dict[tuple[str, str], str] = {}
         self._last_scheduled_service = ""
+        self.large_context_max_tokens = max(0, large_context_max_tokens)
+        self.large_context_worker_id = large_context_worker_id.strip()
+        self.large_context_models = tuple(large_context_models)
+        self._exclusive_ticket_id: str | None = None
 
     def worker(self, worker_id: str | None) -> GpuWorkerConfig:
         if worker_id is None or worker_id not in self._workers:
@@ -671,7 +688,13 @@ class FairGpuQueue:
         ticket.final_request = final_request
         ticket.model = model
         ticket.num_ctx = num_ctx
-        if not any(self._worker_can_run(slot.config, ticket) for slot in self._workers.values()):
+        regular_supported = any(
+            self._regular_worker_can_run(slot.config, ticket)
+            for slot in self._workers.values()
+        )
+        if not regular_supported and self._large_context_supported(ticket):
+            ticket.exclusive = True
+        elif not regular_supported:
             raise UnschedulableRequest(
                 f"No GPU worker can run model {model or 'default'} with num_ctx={num_ctx or 'default'}"
             )
@@ -694,12 +717,17 @@ class FairGpuQueue:
             if assigned_worker and not self._worker_can_run(
                 self._workers[assigned_worker].config, ticket
             ):
-                self.journal.cancelled(
-                    ticket.id, error="Assigned GPU cannot satisfy model/context requirements"
-                )
-                raise UnschedulableRequest(
-                    "The GPU reserved by this task cannot satisfy the requested model/context"
-                )
+                if ticket.exclusive:
+                    assigned_slot = self._workers[assigned_worker]
+                    if assigned_slot.active is None:
+                        self._clear_task_owner_locked(assigned_slot)
+                else:
+                    self.journal.cancelled(
+                        ticket.id, error="Assigned GPU cannot satisfy model/context requirements"
+                    )
+                    raise UnschedulableRequest(
+                        "The GPU reserved by this task cannot satisfy the requested model/context"
+                    )
             self._pending.append(ticket)
             self._schedule_locked()
         try:
@@ -730,7 +758,7 @@ class FairGpuQueue:
         return ticket
 
     @staticmethod
-    def _worker_can_run(config: GpuWorkerConfig, ticket: Ticket) -> bool:
+    def _regular_worker_can_run(config: GpuWorkerConfig, ticket: Ticket) -> bool:
         if ticket.kind == "reranker":
             return bool(config.reranker_url)
         if ticket.kind != "llm":
@@ -743,11 +771,42 @@ class FairGpuQueue:
             and ticket.num_ctx > config.max_context_tokens
         )
 
+    def _large_context_supported(self, ticket: Ticket) -> bool:
+        if (
+            ticket.kind != "llm"
+            or ticket.num_ctx is None
+            or ticket.num_ctx <= 0
+            or not self.large_context_max_tokens
+            or ticket.num_ctx > self.large_context_max_tokens
+            or not self.large_context_worker_id
+        ):
+            return False
+        target = self._workers.get(self.large_context_worker_id)
+        if target is None:
+            return False
+        if self.large_context_models and ticket.model not in self.large_context_models:
+            return False
+        return not (
+            target.config.models
+            and ticket.model
+            and ticket.model not in target.config.models
+        )
+
+    def _worker_can_run(self, config: GpuWorkerConfig, ticket: Ticket) -> bool:
+        if ticket.exclusive:
+            return (
+                config.id == self.large_context_worker_id
+                and self._large_context_supported(ticket)
+            )
+        return self._regular_worker_can_run(config, ticket)
+
     async def release(self, ticket: Ticket) -> None:
         async with self._guard:
             slot = self._slot_for_ticket(ticket)
             if slot is not None and slot.active is ticket:
                 slot.active = None
+            if self._exclusive_ticket_id == ticket.id:
+                self._exclusive_ticket_id = None
             if (
                 slot is not None
                 and (ticket.final_request or ticket.cancellation_requested)
@@ -867,6 +926,36 @@ class FairGpuQueue:
 
     def _schedule_locked(self) -> None:
         while self._pending:
+            if self._exclusive_ticket_id is not None:
+                return
+            exclusive = next((item for item in self._pending if item.exclusive), None)
+            if exclusive is not None:
+                now = time.monotonic()
+                if any(
+                    slot.active is not None or slot.unavailable_until > now
+                    for slot in self._workers.values()
+                ):
+                    # Stop assigning new work and let all running jobs finish.
+                    return
+                target = self._workers.get(self.large_context_worker_id)
+                if target is None or not self._worker_can_run(target.config, exclusive):
+                    return
+                for slot in self._workers.values():
+                    if slot.task_owner is not None:
+                        self._clear_task_owner_locked(slot)
+                self._pending.remove(exclusive)
+                target.active = exclusive
+                target.task_owner = exclusive.task_key
+                if exclusive.task_key is not None:
+                    self._task_workers[exclusive.task_key] = target.config.id
+                target.batch_kind = exclusive.kind
+                target.batch_started = now
+                target.batch_count += 1
+                exclusive.worker_id = target.config.id
+                self._exclusive_ticket_id = exclusive.id
+                self._last_scheduled_service = exclusive.service
+                exclusive.ready.set()
+                return
             made_progress = False
             for slot in self._workers.values():
                 if slot.active is not None or slot.unavailable_until > time.monotonic():
@@ -992,6 +1081,8 @@ class FairGpuQueue:
                     "source_id": item.source_id,
                     "kind": item.kind,
                     "request_count": 1,
+                    "num_ctx": item.num_ctx,
+                    "exclusive": item.exclusive,
                     "worker_id": self._task_workers.get(item.task_key) if item.task_key else None,
                     "worker_label": self.worker_label(
                         self._task_workers.get(item.task_key) if item.task_key else None
@@ -999,6 +1090,13 @@ class FairGpuQueue:
                 })
             else:
                 task_queue[position]["request_count"] = int(task_queue[position]["request_count"]) + 1
+                task_queue[position]["exclusive"] = bool(
+                    task_queue[position]["exclusive"] or item.exclusive
+                )
+                if item.num_ctx:
+                    task_queue[position]["num_ctx"] = max(
+                        int(task_queue[position]["num_ctx"] or 0), item.num_ctx
+                    )
         active_jobs = []
         task_owners = []
         workers = []
@@ -1017,6 +1115,7 @@ class FairGpuQueue:
                 "worker_label": slot.config.label,
                 "model": slot.active.model,
                 "num_ctx": slot.active.num_ctx,
+                "exclusive": slot.active.exclusive,
                 "cancellation_pending": slot.active.cancellation_requested,
             }
             if active is not None:
@@ -1041,6 +1140,7 @@ class FairGpuQueue:
                 "last_error": slot.last_error,
                 "failure_count": slot.failure_count,
                 "busy": slot.active is not None,
+                "reserved_by_exclusive": self._exclusive_ticket_id is not None,
                 "task_owner": owner,
                 "batch_kind": slot.batch_kind,
                 "batch_count": slot.batch_count,
@@ -1064,12 +1164,25 @@ class FairGpuQueue:
                     "route": item.route,
                     "model": item.model,
                     "num_ctx": item.num_ctx,
+                    "exclusive": item.exclusive,
                 }
                 for item in self._pending
             ],
             "by_service_kind": dict(counts),
             "batch_kind": first_slot.batch_kind,
             "batch_count": sum(slot.batch_count for slot in self._workers.values()),
+            "exclusive_active": self._exclusive_ticket_id is not None,
+            "exclusive_waiting": any(item.exclusive for item in self._pending),
+            "large_context": {
+                "enabled": bool(
+                    self.large_context_max_tokens
+                    and self.large_context_worker_id in self._workers
+                ),
+                "max_tokens": self.large_context_max_tokens,
+                "worker_id": self.large_context_worker_id,
+                "worker_label": self.worker_label(self.large_context_worker_id),
+                "models": list(self.large_context_models),
+            },
         }
 
 

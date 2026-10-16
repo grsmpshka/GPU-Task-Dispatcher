@@ -235,7 +235,7 @@ async function refreshQueue() {
     if (activeJobs.length || idleOwners.length) {
       $('queue-active').className = 'queue-active';
       $('queue-active').innerHTML = [
-        ...activeJobs.map(job => `<div class="queue-active-line"><div><b><span class="status-dot ${job.cancellation_pending?'cancellation_pending':'running'}"></span>${workerLabel(job)} · ${serviceLabel(job.service)} · ${kindLabel(job.kind)}${job.cancellation_pending?' · останавливается':''}</b><div class="muted">${job.route} · ID задачи: ${sourceId(job.source_id)}${job.num_ctx?` · контекст: ${job.num_ctx}`:''}</div></div><button class="stop-btn" data-job-id="${job.id}" ${job.cancellation_pending?'disabled':''} onclick="stopJob('${job.id}')">${job.cancellation_pending?'Ожидание':'Остановить'}</button></div>`),
+        ...activeJobs.map(job => `<div class="queue-active-line"><div><b><span class="status-dot ${job.cancellation_pending?'cancellation_pending':'running'}"></span>${workerLabel(job)} · ${serviceLabel(job.service)} · ${kindLabel(job.kind)}${job.exclusive?' · большой контекст':''}${job.cancellation_pending?' · останавливается':''}</b><div class="muted">${job.route} · ID задачи: ${sourceId(job.source_id)}${job.num_ctx?` · контекст: ${job.num_ctx}`:''}${job.exclusive?' · обе GPU зарезервированы':''}</div></div><button class="stop-btn" data-job-id="${job.id}" ${job.cancellation_pending?'disabled':''} onclick="stopJob('${job.id}')">${job.cancellation_pending?'Ожидание':'Остановить'}</button></div>`),
         ...idleOwners.map(owner => {
           const seconds = owner.release_in_ms == null ? '' : ` · освобождение через ${Math.max(1,Math.ceil(owner.release_in_ms/1000))} с`;
           return `<div class="queue-active-line"><div><b><span class="status-dot queued"></span>${workerLabel(owner)} · ${serviceLabel(owner.service)} · задача удерживает слот</b><div class="muted">ID задачи: ${sourceId(owner.source_id)}${seconds}</div></div></div>`;
@@ -254,7 +254,7 @@ async function refreshQueue() {
       const [service,kind] = key.split(':');
       return `<div class="row"><div><b>${serviceLabel(service)}</b><br><span class="muted">${kindLabel(kind)}</span></div><span class="pill">${count}</span></div>`;
     });
-    rows($('queue-pending'), d.task_queue || d.pending || [], job => `<div class="row"><div><b>${serviceLabel(job.service)} · ${kindLabel(job.kind)}</b><br><span class="muted">ID задачи: ${sourceId(job.source_id)}${job.worker_id ? ` · ${workerLabel(job)}` : ''}${job.request_count > 1 ? ` · запросов: ${job.request_count}` : ''}</span></div><button class="stop-btn" data-job-id="${job.id}" onclick="stopJob('${job.id}')">Стоп</button></div>`);
+    rows($('queue-pending'), d.task_queue || d.pending || [], job => `<div class="row"><div><b>${serviceLabel(job.service)} · ${kindLabel(job.kind)}${job.exclusive?' · большой контекст':''}</b><br><span class="muted">ID задачи: ${sourceId(job.source_id)}${job.num_ctx?` · контекст: ${job.num_ctx}`:''}${job.worker_id ? ` · ${workerLabel(job)}` : ''}${job.request_count > 1 ? ` · запросов: ${job.request_count}` : ''}</span></div><button class="stop-btn" data-job-id="${job.id}" onclick="stopJob('${job.id}')">Стоп</button></div>`);
     const recent = d.recent || [];
     const total = Number(d.recent_total || 0);
     const totalPages = Math.max(1, Math.ceil(total / queuePageSize));
