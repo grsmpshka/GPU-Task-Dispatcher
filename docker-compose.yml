@@ -212,7 +212,7 @@ services:
 
   whisper-gpu-1:
     profiles: ["gpu-workers"]
-    image: whisper-service:latest
+    image: "${WHISPER_IMAGE:-whisper-service:latest}"
     container_name: whisper-service
     restart: unless-stopped
     ports:
@@ -222,9 +222,13 @@ services:
     environment:
       WHISPER_HOST: "0.0.0.0"
       WHISPER_PORT: "8000"
+      GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN:-}"
+      GIGAAM_MODELS: "${GIGAAM_MODELS:-v3_e2e_rnnt}"
+      GIGAAM_BATCH_SIZE: "${GIGAAM_BATCH_SIZE:-8}"
     volumes:
       - /opt/whisper-service/cache/huggingface:/root/.cache/huggingface
       - /opt/whisper-service/cache/whisper:/root/.cache/whisper
+      - /opt/whisper-service/cache/gigaam:/root/.cache/gigaam
     deploy:
       resources:
         reservations:
@@ -235,7 +239,7 @@ services:
 
   whisper-gpu-2:
     profiles: ["gpu-workers"]
-    image: whisper-service:latest
+    image: "${WHISPER_IMAGE:-whisper-service:latest}"
     container_name: whisper-service-gpu-2
     restart: unless-stopped
     ports:
@@ -245,9 +249,13 @@ services:
     environment:
       WHISPER_HOST: "0.0.0.0"
       WHISPER_PORT: "8000"
+      GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN:-}"
+      GIGAAM_MODELS: "${GIGAAM_MODELS:-v3_e2e_rnnt}"
+      GIGAAM_BATCH_SIZE: "${GIGAAM_BATCH_SIZE:-8}"
     volumes:
       - /opt/whisper-service/cache/huggingface:/root/.cache/huggingface
       - /opt/whisper-service/cache/whisper:/root/.cache/whisper
+      - /opt/whisper-service/cache/gigaam:/root/.cache/gigaam
     deploy:
       resources:
         reservations:

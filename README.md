@@ -161,6 +161,35 @@ sudo systemctl mask ollama.service
 docker compose --profile gpu-workers up -d whisper-gpu-1 whisper-gpu-2
 ```
 
+### Выбор STT-модели
+
+Оба STT worker поддерживают Whisper и GigaAM-v3 через один совместимый маршрут
+`POST /v1/audio/transcriptions`. Движок выбирается полем multipart-формы
+`model`:
+
+- `medium` и `large-v3` — Whisper;
+- `gigaam-v3_e2e_rnnt` — GigaAM-v3 для русской речи.
+
+Если поле `model` не передано, сохраняется прежнее значение по умолчанию
+`large-v3`. Список моделей доступен через `GET /v1/models`, а `/health` каждого
+STT worker показывает `available_models` и `loaded_models`. Модель GigaAM
+запускается лениво и участвует в той же общей очереди брокера, что Whisper,
+Ollama и Reranker. Перед сменой типа нагрузки брокер вызывает `/admin/unload`,
+поэтому одновременно держать Whisper и GigaAM в VRAM не требуется.
+
+Для сборки поверх уже проверенного рабочего образа Whisper:
+
+```bash
+docker build -f stt-service/Dockerfile.runtime-upgrade \
+  -t whisper-service:gigaam-v3 stt-service
+docker compose --profile gpu-workers up -d whisper-gpu-1 whisper-gpu-2
+```
+
+Кэш GigaAM хранится отдельно в `/opt/whisper-service/cache/gigaam` и переживает
+пересоздание контейнеров. Полная воспроизводимая сборка находится в
+`stt-service/Dockerfile`; широкий установочный скрипт из исходного архива не
+используется при развёртывании брокера.
+
 Reranker запускается отдельным `llama.cpp` backend, потому что Ollama не
 предоставляет cross-encoder scores. Для него нужен актуально сконвертированный
 F16-GGUF с classifier head и reranker metadata; старые универсальные GGUF дают

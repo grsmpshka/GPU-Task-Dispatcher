@@ -1547,10 +1547,26 @@ async def health() -> dict[str, object]:
         worker_health = []
         for worker in GPU_WORKERS:
             ollama_ok = whisper_ok = reranker_ok = False
+            whisper_models: list[str] = []
+            whisper_loaded_models: list[str] = []
             with contextlib.suppress(Exception):
                 ollama_ok = (await client.get(f"{worker.ollama_url}/api/tags")).is_success
             with contextlib.suppress(Exception):
-                whisper_ok = (await client.get(f"{worker.whisper_url}/health")).is_success
+                whisper_response = await client.get(f"{worker.whisper_url}/health")
+                whisper_ok = whisper_response.is_success
+                if whisper_ok:
+                    whisper_payload = whisper_response.json()
+                    if isinstance(whisper_payload, dict):
+                        whisper_models = [
+                            str(model)
+                            for model in whisper_payload.get("available_models", [])
+                            if str(model).strip()
+                        ]
+                        whisper_loaded_models = [
+                            str(model)
+                            for model in whisper_payload.get("loaded_models", [])
+                            if str(model).strip()
+                        ]
             with contextlib.suppress(Exception):
                 reranker_ok = (
                     await client.get(f"{worker.reranker_url}/health")
@@ -1562,6 +1578,8 @@ async def health() -> dict[str, object]:
                 "label": worker.label,
                 "ollama": ollama_ok,
                 "whisper": whisper_ok,
+                "whisper_models": whisper_models,
+                "whisper_loaded_models": whisper_loaded_models,
                 "reranker": reranker_ok,
                 "runtime_available": runtime_available,
                 "cooldown_remaining_ms": runtime.get("cooldown_remaining_ms", 0),
@@ -1571,10 +1589,17 @@ async def health() -> dict[str, object]:
                 ),
             })
     all_ok = all(item["available"] for item in worker_health)
+    stt_model_sets = [
+        set(item["whisper_models"])
+        for item in worker_health
+        if item["whisper"]
+    ]
+    stt_models = sorted(set.intersection(*stt_model_sets)) if stt_model_sets else []
     return {
         "status": "ok" if all_ok else "degraded",
         "ollama": all(item["ollama"] for item in worker_health),
         "whisper": all(item["whisper"] for item in worker_health),
+        "stt_models": stt_models,
         "reranker": all(item["reranker"] for item in worker_health),
         "worker_health": worker_health,
         **queue.snapshot(),

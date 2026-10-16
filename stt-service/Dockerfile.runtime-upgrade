@@ -1,0 +1,25 @@
+# Safe upgrade path for the already deployed whisper-service image.
+# It keeps the working CUDA/PyTorch/Whisper stack and adds only the GigaAM
+# runtime plus the API implementation from this directory.
+ARG BASE_IMAGE=whisper-service:latest
+FROM ${BASE_IMAGE}
+
+ARG GIGAAM_REF=7447938d791c4f3e643386ee22c33777004293a5
+
+RUN pip install --no-cache-dir \
+      hydra-core==1.3.2 \
+      omegaconf==2.3.0 \
+      antlr4-python3-runtime==4.9.3 \
+      sentencepiece==0.2.1 \
+      soundfile==0.13.1 \
+    && pip install --no-cache-dir --no-deps \
+      "gigaam @ https://github.com/salute-developers/GigaAM/archive/${GIGAAM_REF}.tar.gz"
+
+WORKDIR /app
+COPY whisper_api.py warmup.py ./
+
+ENV WHISPER_PRELOAD_MODEL=false
+ENV GIGAAM_MODELS=v3_e2e_rnnt
+ENV GIGAAM_BATCH_SIZE=8
+
+CMD ["python", "whisper_api.py"]
