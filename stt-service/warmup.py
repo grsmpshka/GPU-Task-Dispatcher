@@ -13,7 +13,14 @@ from __future__ import annotations
 
 import os
 
-from whisper_api import GIGAAM_MODEL_NAMES, WHISPER_ENGINE, WHISPER_MODEL_CACHE, WHISPER_MODEL_NAMES
+from whisper_api import (
+    GIGAAM_MODEL_NAMES,
+    NEMOTRON_DIARIZATION_MODEL,
+    NEMOTRON_DIARIZATION_REVISION,
+    WHISPER_ENGINE,
+    WHISPER_MODEL_CACHE,
+    WHISPER_MODEL_NAMES,
+)
 
 
 def warm_whisper() -> None:
@@ -52,6 +59,18 @@ def warm_diarization() -> None:
     from pyannote.audio import Pipeline
 
     Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=True)
+
+    print(f"[warmup] diarization: {NEMOTRON_DIARIZATION_MODEL}", flush=True)
+    from transformers import AutoModelForAudioFrameClassification, AutoProcessor
+
+    AutoProcessor.from_pretrained(
+        NEMOTRON_DIARIZATION_MODEL,
+        revision=NEMOTRON_DIARIZATION_REVISION,
+    )
+    AutoModelForAudioFrameClassification.from_pretrained(
+        NEMOTRON_DIARIZATION_MODEL,
+        revision=NEMOTRON_DIARIZATION_REVISION,
+    )
 
 
 if __name__ == "__main__":

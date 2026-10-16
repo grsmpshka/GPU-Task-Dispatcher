@@ -1,8 +1,9 @@
 # whisper-service
 
 Локальный, полностью изолированный от интернета во время работы (кроме
-первого разворачивания) STT-сервис: Whisper и GigaAM-v3 (транскрибация) + pyannote
-(диаризация по спикерам), упакован в Docker с GPU-инференсом.
+первого разворачивания) STT-сервис: Whisper и GigaAM-v3 (транскрибация) +
+pyannote или NVIDIA Nemotron 3 (диаризация по спикерам), упакован в Docker
+с GPU-инференсом.
 
 Движок выбирается полем `model` запроса: `medium` / `large-v3` — Whisper,
 `gigaam-v3_e2e_rnnt` — GigaAM-v3 (только русский, с пунктуацией и
@@ -68,6 +69,9 @@ sudo ./deploy.sh
 | `WHISPER_MODELS` | `medium,large-v3` | разрешённые для выбора модели |
 | `GIGAAM_MODELS` | `v3_e2e_rnnt` | модели GigaAM; в API доступны как `gigaam-<имя>` (пусто — GigaAM выключен) |
 | `GIGAAM_BATCH_SIZE` | `8` | размер батча VAD-чанков GigaAM |
+| `NEMOTRON_DIARIZATION_MODEL` | `nvidia/Nemotron-3-Diarization` | идентификатор Nemotron в Hugging Face |
+| `NEMOTRON_DIARIZATION_REVISION` | закреплённый SHA | проверенная ревизия весов и конфигурации |
+| `NEMOTRON_STREAMING_MODE` | `low_latency` | потоковый режим с общим speaker cache между фрагментами |
 | `WHISPER_MAX_UPLOAD_MB` | `2048` | лимит размера загружаемого файла (413 при превышении) |
 | `WHISPER_PRELOAD_MODEL` | `true` | загрузить модель по умолчанию в GPU при старте, убирая холодную задержку первого задания |
 | `HF_TOKEN` | (в `.env`) | токен Hugging Face с принятыми лицензиями `pyannote/speaker-diarization-3.1`, `pyannote/speaker-diarization-community-1` и `pyannote/segmentation-3.0` (VAD для GigaAM) |
@@ -75,6 +79,14 @@ sudo ./deploy.sh
 Оба дефолта переопределяются per-request полями формы `model` и
 `diarize` в `/v1/audio/transcriptions` - в кэше после `deploy.sh` лежат веса
 всех моделей из `WHISPER_MODELS` и `GIGAAM_MODELS`, повторного скачивания не будет.
+
+При `diarize=true` можно передать
+`diarization_model=nvidia/Nemotron-3-Diarization`. Без этого поля сохраняется
+прежний pyannote. Nemotron обрабатывает длинное аудио частями с единым кэшем
+спикеров, поддерживает до восьми спикеров и возвращает метки `SPEAKER_00` …
+`SPEAKER_07`. Явная ошибка Nemotron завершает запрос с HTTP 503 и не подменяется
+pyannote. В ответе поле `diarization_model` показывает реально выбранный
+диаризатор.
 
 Ответ содержит `engine` (`whisper` / `gigaam`) и `diarization`
 (`ok` / `failed` / `disabled`). Для GigaAM допустимы только `language=ru`

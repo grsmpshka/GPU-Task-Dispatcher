@@ -1,5 +1,5 @@
 """Local transcription API: Whisper (faster-whisper / openai-whisper) and
-GigaAM-v3, with optional pyannote speaker diarization, on CUDA.
+GigaAM-v3, with optional pyannote or Nemotron speaker diarization, on CUDA.
 
 The engine is chosen per request by the model id:
     "medium", "large-v3", ...    -> Whisper  (WHISPER_MODELS, WHISPER_ENGINE)
@@ -69,6 +69,15 @@ WHISPER_MODEL_NAMES = _env_list("WHISPER_MODELS", "medium,large-v3")
 GIGAAM_MODEL_NAMES = _env_list("GIGAAM_MODELS", "v3_e2e_rnnt")
 GIGAAM_PREFIX = "gigaam-"
 GIGAAM_BATCH_SIZE = max(1, int(os.environ.get("GIGAAM_BATCH_SIZE", "8")))
+PYANNOTE_DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+NEMOTRON_DIARIZATION_MODEL = os.environ.get(
+    "NEMOTRON_DIARIZATION_MODEL", "nvidia/Nemotron-3-Diarization"
+).strip()
+NEMOTRON_DIARIZATION_REVISION = os.environ.get(
+    "NEMOTRON_DIARIZATION_REVISION", "f667ed73aee57d40cc39428eb768b4fd87a0a29e"
+).strip()
+NEMOTRON_STREAMING_MODE = os.environ.get("NEMOTRON_STREAMING_MODE", "low_latency").strip()
+DIARIZATION_MODELS = (PYANNOTE_DIARIZATION_MODEL, NEMOTRON_DIARIZATION_MODEL)
 
 # model id -> (engine, native model name)
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
@@ -79,6 +88,8 @@ AVAILABLE_MODELS = tuple(MODEL_REGISTRY)
 
 MODELS: dict[str, Any] = {}
 DIARIZATION_PIPELINE = None  # loaded lazily on the first diarize=true request
+NEMOTRON_DIARIZATION_PROCESSOR = None
+NEMOTRON_DIARIZATION_PIPELINE = None
 MODEL_STATE_LOCK = RLock()
 GPU_LOCK = Lock()  # one heavy GPU job at a time
 ACTIVE_TASKS = 0
@@ -124,7 +135,8 @@ def unload_models_if_idle() -> bool:
 
     Called by the idle timer and by the GPU dispatcher (/admin/unload).
     """
-    global DIARIZATION_PIPELINE, IDLE_UNLOAD_TIMER
+    global DIARIZATION_PIPELINE, NEMOTRON_DIARIZATION_PROCESSOR, NEMOTRON_DIARIZATION_PIPELINE
+    global IDLE_UNLOAD_TIMER
     with MODEL_STATE_LOCK:
         if IDLE_UNLOAD_TIMER is threading.current_thread():
             # Fired timer: forget only our own handle, never a newer timer.
@@ -138,19 +150,27 @@ def unload_models_if_idle() -> bool:
 
         vad_utils = sys.modules.get("gigaam.vad_utils")
         vad_loaded = vad_utils is not None and getattr(vad_utils, "_PIPELINE", None) is not None
-        if not MODELS and DIARIZATION_PIPELINE is None and not vad_loaded:
+        if (
+            not MODELS
+            and DIARIZATION_PIPELINE is None
+            and NEMOTRON_DIARIZATION_PIPELINE is None
+            and not vad_loaded
+        ):
             return False
 
         loaded_models = list(MODELS)
         diarization_was_loaded = DIARIZATION_PIPELINE is not None
+        nemotron_was_loaded = NEMOTRON_DIARIZATION_PIPELINE is not None
         MODELS.clear()
         DIARIZATION_PIPELINE = None
+        NEMOTRON_DIARIZATION_PROCESSOR = None
+        NEMOTRON_DIARIZATION_PIPELINE = None
         if vad_loaded:
             vad_utils._PIPELINE = None  # GigaAM caches its VAD pipeline globally
         release_cuda_memory()
         logger.info(
-            "Unloaded GPU resources (models=%s, diarization=%s, gigaam_vad=%s)",
-            loaded_models, diarization_was_loaded, vad_loaded,
+            "Unloaded GPU resources (models=%s, pyannote=%s, nemotron=%s, gigaam_vad=%s)",
+            loaded_models, diarization_was_loaded, nemotron_was_loaded, vad_loaded,
         )
         return True
 
@@ -265,6 +285,34 @@ def get_diarization_pipeline():
             pipeline.to(torch.device("cuda"))
             DIARIZATION_PIPELINE = pipeline
         return DIARIZATION_PIPELINE
+
+
+def get_nemotron_diarization_pipeline() -> tuple[Any, Any]:
+    """Load the pinned native Transformers Nemotron runtime lazily on CUDA."""
+    global NEMOTRON_DIARIZATION_PROCESSOR, NEMOTRON_DIARIZATION_PIPELINE
+    with MODEL_STATE_LOCK:
+        if NEMOTRON_DIARIZATION_PIPELINE is None:
+            from transformers import AutoModelForAudioFrameClassification, AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                NEMOTRON_DIARIZATION_MODEL,
+                revision=NEMOTRON_DIARIZATION_REVISION,
+            )
+
+            def load() -> Any:
+                model = AutoModelForAudioFrameClassification.from_pretrained(
+                    NEMOTRON_DIARIZATION_MODEL,
+                    revision=NEMOTRON_DIARIZATION_REVISION,
+                    dtype=torch.float16,
+                    attn_implementation="sdpa",
+                )
+                return model.to(torch.device("cuda")).eval()
+
+            model = _load_with_cuda_retries("Nemotron 3 Diarization", load)
+            processor.set_streaming_mode(NEMOTRON_STREAMING_MODE)
+            NEMOTRON_DIARIZATION_PROCESSOR = processor
+            NEMOTRON_DIARIZATION_PIPELINE = model
+        return NEMOTRON_DIARIZATION_PROCESSOR, NEMOTRON_DIARIZATION_PIPELINE
 
 
 # --------------------------------------------------------------------------- audio
@@ -411,6 +459,54 @@ def diarize_audio(wav_path: str, num_speakers: int | None = None) -> list[Turn]:
     return turns
 
 
+def diarize_audio_nemotron(wav_path: str, num_speakers: int | None = None) -> list[Turn]:
+    """Chunked Nemotron inference that retains speaker identities across chunks."""
+    processor, model = get_nemotron_diarization_pipeline()
+    audio_tensor = load_pcm16_waveform(wav_path)["waveform"][0]
+    audio = audio_tensor.numpy()
+    sampling_rate = int(processor.feature_extractor.sampling_rate)
+    speaker_cache = None
+    logits: list[torch.Tensor] = []
+
+    def infer(chunk: Any, *, first: bool, last: bool) -> None:
+        nonlocal speaker_cache
+        inputs = processor(
+            chunk,
+            sampling_rate=sampling_rate,
+            is_streaming=True,
+            is_first_audio_chunk=first,
+            is_last_audio_chunk=last,
+        )
+        inputs = inputs.to(model.device, dtype=model.dtype)
+        with torch.inference_mode():
+            outputs = model(**inputs, speaker_cache=speaker_cache)
+        logits.append(outputs.logits.detach().to(device="cpu", dtype=torch.float32))
+        speaker_cache = outputs.speaker_cache
+
+    first_size = int(processor.num_samples_first_audio_chunk)
+    if audio.shape[0] <= first_size:
+        infer(audio, first=True, last=True)
+    else:
+        infer(audio[:first_size], first=True, last=False)
+        mel_frame_idx = int(processor.num_mel_frames_per_step)
+        start_idx = int(processor.audio_chunk_start(mel_frame_idx))
+        chunk_size = int(processor.num_samples_per_audio_chunk)
+        while start_idx + chunk_size <= audio.shape[0]:
+            infer(audio[start_idx:start_idx + chunk_size], first=False, last=False)
+            mel_frame_idx += int(processor.num_mel_frames_per_step)
+            start_idx = int(processor.audio_chunk_start(mel_frame_idx))
+        infer(audio[start_idx:], first=False, last=True)
+
+    speaker_dict = processor.extract_speaker_dict(torch.cat(logits, dim=1))[0]
+    turns = [
+        (float(segment["Start"]), float(segment["End"]), f"SPEAKER_{int(segment['Speaker']):02d}")
+        for segment in speaker_dict
+        if num_speakers is None or int(segment["Speaker"]) < num_speakers
+    ]
+    turns.sort(key=lambda turn: (turn[0], turn[2]))
+    return turns
+
+
 class SpeakerIndex:
     """O(log n) lookup of the best-overlapping turn, with nearest-turn fallback.
 
@@ -504,7 +600,13 @@ def build_segments(raw_segments: list[dict[str, Any]], turns: list[Turn] | None 
 
 
 def process(
-    src_path: str, model_id: str, language: str | None, task: str, diarize: bool, num_speakers: int | None
+    src_path: str,
+    model_id: str,
+    language: str | None,
+    task: str,
+    diarize: bool,
+    num_speakers: int | None,
+    diarization_model: str | None,
 ) -> dict[str, Any]:
     """Blocking part of a request; runs in a worker thread, never on the event loop."""
     engine, _ = MODEL_REGISTRY[model_id]
@@ -520,9 +622,15 @@ def process(
             turns: list[Turn] | None = None
             if diarize:
                 try:
-                    turns = diarize_audio(wav_path, num_speakers=num_speakers)
+                    if diarization_model == NEMOTRON_DIARIZATION_MODEL:
+                        turns = diarize_audio_nemotron(wav_path, num_speakers=num_speakers)
+                    else:
+                        turns = diarize_audio(wav_path, num_speakers=num_speakers)
                     diarization_status = "ok"
-                except Exception:
+                except Exception as exc:
+                    if diarization_model == NEMOTRON_DIARIZATION_MODEL:
+                        logger.exception("Nemotron diarization failed")
+                        raise HTTPException(status_code=503, detail="Nemotron diarization failed") from exc
                     # Best-effort: keep the transcript, report the failure explicitly.
                     logger.exception("Diarization failed, returning segments without speaker labels")
                     diarization_status = "failed"
@@ -533,6 +641,7 @@ def process(
             "model": model_id,
             "engine": engine,
             "diarization": diarization_status,
+            "diarization_model": diarization_model if diarize else None,
             "segments": build_segments(raw_segments, turns),
         }
     finally:
@@ -551,6 +660,17 @@ def health() -> dict[str, object]:
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "loaded_models": list(MODELS),
         "diarization_loaded": DIARIZATION_PIPELINE is not None,
+        "loaded_diarization_models": [
+            model_id
+            for model_id, loaded in (
+                (PYANNOTE_DIARIZATION_MODEL, DIARIZATION_PIPELINE is not None),
+                (NEMOTRON_DIARIZATION_MODEL, NEMOTRON_DIARIZATION_PIPELINE is not None),
+            )
+            if loaded
+        ],
+        "available_diarization_models": list(DIARIZATION_MODELS),
+        "nemotron_revision": NEMOTRON_DIARIZATION_REVISION,
+        "nemotron_streaming_mode": NEMOTRON_STREAMING_MODE,
         "default_model": DEFAULT_MODEL,
         "default_diarize": DEFAULT_DIARIZE,
         "available_models": list(AVAILABLE_MODELS),
@@ -598,6 +718,7 @@ async def transcribe(
     task: str = Form("transcribe"),
     diarize: bool = Form(DEFAULT_DIARIZE),
     num_speakers: int | None = Form(None),
+    diarization_model: str | None = Form(None),
 ) -> dict[str, object]:
     """Transcribe an uploaded audio/video file with Whisper or GigaAM-v3."""
     if not torch.cuda.is_available():
@@ -606,8 +727,17 @@ async def transcribe(
         raise HTTPException(status_code=422, detail=f"model must be one of: {', '.join(AVAILABLE_MODELS)}")
     if task not in {"transcribe", "translate"}:
         raise HTTPException(status_code=422, detail="task must be transcribe or translate")
-    if num_speakers is not None and not 1 <= num_speakers <= 20:
-        raise HTTPException(status_code=422, detail="num_speakers must be between 1 and 20")
+    selected_diarization_model = diarization_model or PYANNOTE_DIARIZATION_MODEL
+    if diarization_model is not None and not diarize:
+        raise HTTPException(status_code=422, detail="diarization_model requires diarize=true")
+    if selected_diarization_model not in DIARIZATION_MODELS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"diarization_model must be one of: {', '.join(DIARIZATION_MODELS)}",
+        )
+    max_speakers = 8 if selected_diarization_model == NEMOTRON_DIARIZATION_MODEL else 20
+    if num_speakers is not None and not 1 <= num_speakers <= max_speakers:
+        raise HTTPException(status_code=422, detail=f"num_speakers must be between 1 and {max_speakers}")
     if MODEL_REGISTRY[model][0] == "gigaam":
         if task != "transcribe":
             raise HTTPException(status_code=422, detail="GigaAM supports task=transcribe only")
@@ -627,7 +757,16 @@ async def transcribe(
                     raise HTTPException(status_code=413, detail="file is too large")
                 temp_file.write(chunk)
 
-        return await run_in_threadpool(process, temp_path, model, language or None, task, diarize, num_speakers)
+        return await run_in_threadpool(
+            process,
+            temp_path,
+            model,
+            language or None,
+            task,
+            diarize,
+            num_speakers,
+            selected_diarization_model,
+        )
     finally:
         if temp_path:
             with suppress(FileNotFoundError):

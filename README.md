@@ -177,11 +177,19 @@ STT worker показывает `available_models` и `loaded_models`. Моде�
 Ollama и Reranker. Перед сменой типа нагрузки брокер вызывает `/admin/unload`,
 поэтому одновременно держать Whisper и GigaAM в VRAM не требуется.
 
+Диаризатор также выбирается полем multipart-формы. При `diarize=true` без
+дополнительного поля используется прежний `pyannote/speaker-diarization-3.1`.
+Для Nemotron передайте
+`diarization_model=nvidia/Nemotron-3-Diarization`. Он поддерживает до восьми
+спикеров и обрабатывает длинные записи потоковыми фрагментами, сохраняя
+идентичность спикеров между ними. Явный запрос Nemotron не имеет скрытого
+fallback на pyannote: ошибка возвращается клиенту как HTTP 503.
+
 Для сборки поверх уже проверенного рабочего образа Whisper:
 
 ```bash
 docker build -f stt-service/Dockerfile.runtime-upgrade \
-  -t whisper-service:gigaam-v3 stt-service
+  -t whisper-service:gigaam-nemotron stt-service
 docker compose --profile gpu-workers up -d whisper-gpu-1 whisper-gpu-2
 ```
 

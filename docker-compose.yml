@@ -225,6 +225,9 @@ services:
       GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN:-}"
       GIGAAM_MODELS: "${GIGAAM_MODELS:-v3_e2e_rnnt}"
       GIGAAM_BATCH_SIZE: "${GIGAAM_BATCH_SIZE:-8}"
+      NEMOTRON_DIARIZATION_MODEL: "${NEMOTRON_DIARIZATION_MODEL:-nvidia/Nemotron-3-Diarization}"
+      NEMOTRON_DIARIZATION_REVISION: "${NEMOTRON_DIARIZATION_REVISION:-f667ed73aee57d40cc39428eb768b4fd87a0a29e}"
+      NEMOTRON_STREAMING_MODE: "${NEMOTRON_STREAMING_MODE:-low_latency}"
     volumes:
       - /opt/whisper-service/cache/huggingface:/root/.cache/huggingface
       - /opt/whisper-service/cache/whisper:/root/.cache/whisper
@@ -252,6 +255,9 @@ services:
       GPU_DISPATCHER_TOKEN: "${GPU_DISPATCHER_TOKEN:-}"
       GIGAAM_MODELS: "${GIGAAM_MODELS:-v3_e2e_rnnt}"
       GIGAAM_BATCH_SIZE: "${GIGAAM_BATCH_SIZE:-8}"
+      NEMOTRON_DIARIZATION_MODEL: "${NEMOTRON_DIARIZATION_MODEL:-nvidia/Nemotron-3-Diarization}"
+      NEMOTRON_DIARIZATION_REVISION: "${NEMOTRON_DIARIZATION_REVISION:-f667ed73aee57d40cc39428eb768b4fd87a0a29e}"
+      NEMOTRON_STREAMING_MODE: "${NEMOTRON_STREAMING_MODE:-low_latency}"
     volumes:
       - /opt/whisper-service/cache/huggingface:/root/.cache/huggingface
       - /opt/whisper-service/cache/whisper:/root/.cache/whisper
