@@ -1549,6 +1549,8 @@ async def health() -> dict[str, object]:
             ollama_ok = whisper_ok = reranker_ok = False
             whisper_models: list[str] = []
             whisper_loaded_models: list[str] = []
+            diarization_models: list[str] = []
+            loaded_diarization_models: list[str] = []
             with contextlib.suppress(Exception):
                 ollama_ok = (await client.get(f"{worker.ollama_url}/api/tags")).is_success
             with contextlib.suppress(Exception):
@@ -1567,6 +1569,16 @@ async def health() -> dict[str, object]:
                             for model in whisper_payload.get("loaded_models", [])
                             if str(model).strip()
                         ]
+                        diarization_models = [
+                            str(model)
+                            for model in whisper_payload.get("available_diarization_models", [])
+                            if str(model).strip()
+                        ]
+                        loaded_diarization_models = [
+                            str(model)
+                            for model in whisper_payload.get("loaded_diarization_models", [])
+                            if str(model).strip()
+                        ]
             with contextlib.suppress(Exception):
                 reranker_ok = (
                     await client.get(f"{worker.reranker_url}/health")
@@ -1580,6 +1592,8 @@ async def health() -> dict[str, object]:
                 "whisper": whisper_ok,
                 "whisper_models": whisper_models,
                 "whisper_loaded_models": whisper_loaded_models,
+                "diarization_models": diarization_models,
+                "loaded_diarization_models": loaded_diarization_models,
                 "reranker": reranker_ok,
                 "runtime_available": runtime_available,
                 "cooldown_remaining_ms": runtime.get("cooldown_remaining_ms", 0),
@@ -1595,11 +1609,22 @@ async def health() -> dict[str, object]:
         if item["whisper"]
     ]
     stt_models = sorted(set.intersection(*stt_model_sets)) if stt_model_sets else []
+    diarization_model_sets = [
+        set(item["diarization_models"])
+        for item in worker_health
+        if item["whisper"]
+    ]
+    stt_diarization_models = (
+        sorted(set.intersection(*diarization_model_sets))
+        if diarization_model_sets
+        else []
+    )
     return {
         "status": "ok" if all_ok else "degraded",
         "ollama": all(item["ollama"] for item in worker_health),
         "whisper": all(item["whisper"] for item in worker_health),
         "stt_models": stt_models,
+        "stt_diarization_models": stt_diarization_models,
         "reranker": all(item["reranker"] for item in worker_health),
         "worker_health": worker_health,
         **queue.snapshot(),
